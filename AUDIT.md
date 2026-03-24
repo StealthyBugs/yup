@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-The audit identified **5 confirmed high-confidence XSS vulnerabilities**, **4 medium-severity issues**, and several low-severity/defense-in-depth gaps. No postMessage handlers were found in the codebase. The most critical finding is a stored XSS via GeoJSON artifact rendering that executes in the main application origin with zero sanitization.
+The audit identified **6 confirmed high-confidence XSS vulnerabilities**, **4 medium-severity issues**, and several low-severity/defense-in-depth gaps. No postMessage handlers were found in the codebase. The most critical finding is a stored XSS via GeoJSON artifact rendering that executes in the main application origin with zero sanitization.
 
 ---
 
@@ -76,6 +76,22 @@ The audit identified **5 confirmed high-confidence XSS vulnerabilities**, **4 me
 | **Production-reachable** | YES — requires user click on the "Source Run" link in the model version page |
 | **PoC** | `curl -X POST http://mlflow:5000/api/2.0/mlflow/model-versions/create -d '{"name":"m","source":"s3://b/m","run_link":"javascript:alert(document.cookie)"}'` — then visit the model version page and click the run link. |
 | **Fix** | Validate URL scheme on both server and client. Server: reject `run_link` values not starting with `http://` or `https://`. Client: use a `sanitizeUrl()` utility that blocks `javascript:`, `data:`, `vbscript:` protocols. |
+
+---
+
+### Finding 4b: Stored XSS via `javascript:` URI in Dataset Source URL href
+
+| Field | Value |
+|-------|-------|
+| **Type** | Stored XSS (javascript: URI injection) |
+| **File** | `mlflow/server/js/src/experiment-tracking/components/experiment-page/components/runs/ExperimentViewDatasetSourceURL.tsx` |
+| **Attacker-controlled source** | `dataset.source` JSON field — set via `mlflow.log_input()` API, the `url` property is extracted by `getDatasetSourceUrl()` in `DatasetUtils.ts` |
+| **Sink** | `<Typography.Link href={url} openInNewTab>` — direct href injection |
+| **Source→Sink path** | Attacker logs a dataset input with source JSON `{"url":"javascript:alert(document.cookie)","type":"http"}` via `mlflow.log_input()` → stored in DB → frontend calls `getDatasetSourceUrl()` which extracts `parsed.url` for `HTTP` and `EXTERNAL` source types → passed directly to `<Typography.Link href={url}>` → user clicks link → JS executes in MLflow origin |
+| **Why sanitization fails** | No URL protocol validation exists. `getDatasetSourceUrl()` returns `parsed.url ?? null` directly for HTTP/EXTERNAL types. No scheme check, no `isValidHttpUrl()` call, no CSP. |
+| **Production-reachable** | YES — requires user click on the dataset source URL link in the runs table |
+| **PoC** | Log a dataset with HTTP source type and `javascript:` URL, then view the experiment runs table and click the source link. |
+| **Fix** | Apply `isValidHttpUrl()` validation (already exists in `Utils.tsx`) before rendering the URL in an href. Block `javascript:`, `data:`, `vbscript:` protocols. |
 
 ---
 
@@ -199,7 +215,7 @@ The audit identified **5 confirmed high-confidence XSS vulnerabilities**, **4 me
 
 1. **[Critical]** Sanitize GeoJSON `popupContent` in `ShowArtifactMapView.tsx` — use `document.createTextNode()` or DOMPurify
 2. **[Critical]** Apply `lodash.escape()` to all user-controlled strings in Plotly hovertemplates (`RunsMetricsLinePlot.tsx`, `RunsContourPlot.tsx`, `RunsMetricsBarPlot.tsx`)
-3. **[Critical]** Add URL protocol validation for `run_link` in `ModelVersionView.tsx` — block `javascript:`, `data:`, `vbscript:`
+3. **[Critical]** Add URL protocol validation for `run_link` in `ModelVersionView.tsx` and dataset source URLs in `ExperimentViewDatasetSourceURL.tsx` — block `javascript:`, `data:`, `vbscript:`
 4. **[High]** Add Content-Security-Policy header in `security.py` / `fastapi_security.py`
 5. **[High]** Upgrade `sanitize-html` from `^1.18.5` to latest 2.x
 6. **[High]** Remove `iframe` from `allowedTags` in `MarkdownUtils.ts`
