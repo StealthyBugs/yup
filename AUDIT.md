@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-The audit identified **6 confirmed high-confidence XSS vulnerabilities**, **4 medium-severity issues**, and several low-severity/defense-in-depth gaps. No postMessage handlers were found in the codebase. The most critical finding is a stored XSS via GeoJSON artifact rendering that executes in the main application origin with zero sanitization.
+The audit identified **6 high-confidence XSS vulnerability patterns**, **4 medium-severity issues**, and several low-severity/defense-in-depth gaps. Note: Findings 2 and 3 (Plotly hovertemplate injection) are **version-dependent** — newer MLflow versions set `useDefaultHoverBox={false}` which disables hover tooltips, preventing the XSS from triggering. The unsanitized code paths remain and should still be fixed as defense-in-depth. No postMessage handlers were found in the codebase. The most critical finding is a stored XSS via GeoJSON artifact rendering that executes in the main application origin with zero sanitization.
 
 ---
 
@@ -41,9 +41,9 @@ The audit identified **6 confirmed high-confidence XSS vulnerabilities**, **4 me
 | **Sink** | Plotly `hovertemplate` property — rendered as HTML in tooltip |
 | **Source→Sink path** | User sets run name to XSS payload via API → frontend fetches run data → `createTooltipTemplate(runName)` interpolates raw `runName` into template literal: `` `<b>${runName}</b>:<br>` `` → passed as `hovertemplate` to Plotly → Plotly renders as HTML on hover |
 | **Why sanitization fails** | No escaping applied. The run name is embedded via JS template literal (`${runName}`) at template construction time, not via Plotly's safe `%{...}` reference syntax. |
-| **Production-reachable** | YES — triggers when any user hovers over a data point in the metrics line plot |
-| **PoC** | Create a run with name `<img src=x onerror=alert(document.cookie)>`, log a metric, view the line chart. Hovering over the data point triggers execution. |
-| **Fix** | Apply `lodash.escape()` to `runName` before interpolation: `` `<b>${escape(runName)}</b>:<br>` ``. The correct pattern already exists in `CompareRunScatter.tsx`. |
+| **Production-reachable** | **Version-dependent.** In older MLflow versions, YES — triggers when any user hovers over a data point in the metrics line plot. In newer MLflow versions, Plotly is configured with `useDefaultHoverBox={false}`, which disables the default hover tooltip rendering and **prevents the XSS from triggering on hover**. The unsanitized template construction still exists in the code, but the sink (Plotly's HTML tooltip) is not active. |
+| **PoC** | Create a run with name `<img src=x onerror=alert(document.cookie)>`, log a metric, view the line chart. On older versions, hovering over the data point triggers execution. On newer versions with `useDefaultHoverBox={false}`, the hover tooltip does not render. |
+| **Fix** | Apply `lodash.escape()` to `runName` before interpolation: `` `<b>${escape(runName)}</b>:<br>` ``. The correct pattern already exists in `CompareRunScatter.tsx`. Even though newer versions mitigate via disabled hover box, the unsanitized interpolation should still be fixed as a defense-in-depth measure. |
 
 ---
 
@@ -57,9 +57,9 @@ The audit identified **6 confirmed high-confidence XSS vulnerabilities**, **4 me
 | **Sink** | Plotly `hovertemplate` — rendered as HTML |
 | **Source→Sink path** | User logs metric with key `<img src=x onerror=alert(1)>` → frontend fetches metric data → metric key interpolated directly into HTML template string via JS template literal → Plotly renders as HTML on hover |
 | **Why sanitization fails** | Same as Finding 2 — JS template literal interpolation (`${mKey}`) at construction time, no `lodash.escape()` applied |
-| **Production-reachable** | YES — triggers on hover in contour plots and multi-metric bar plots |
-| **PoC** | `mlflow.log_metric("<img src=x onerror=alert(1)>", 1.0)` then view the bar chart or contour plot. |
-| **Fix** | Apply `lodash.escape()` to all user-controlled strings before template interpolation, matching the pattern in `CompareRunScatter.tsx`. |
+| **Production-reachable** | **Version-dependent.** In older MLflow versions, YES — triggers on hover in contour plots and multi-metric bar plots. In newer MLflow versions, Plotly is configured with `useDefaultHoverBox={false}`, which disables the default hover tooltip rendering and **prevents the XSS from triggering on hover**. The unsanitized template construction still exists in the code, but the sink is not active. |
+| **PoC** | `mlflow.log_metric("<img src=x onerror=alert(1)>", 1.0)` then view the bar chart or contour plot. On older versions, hovering triggers execution. On newer versions with `useDefaultHoverBox={false}`, the hover tooltip does not render. |
+| **Fix** | Apply `lodash.escape()` to all user-controlled strings before template interpolation, matching the pattern in `CompareRunScatter.tsx`. Even with hover disabled in newer versions, fix as defense-in-depth. |
 
 ---
 
@@ -214,7 +214,7 @@ The audit identified **6 confirmed high-confidence XSS vulnerabilities**, **4 me
 ## RECOMMENDED FIXES (Priority Order)
 
 1. **[Critical]** Sanitize GeoJSON `popupContent` in `ShowArtifactMapView.tsx` — use `document.createTextNode()` or DOMPurify
-2. **[Critical]** Apply `lodash.escape()` to all user-controlled strings in Plotly hovertemplates (`RunsMetricsLinePlot.tsx`, `RunsContourPlot.tsx`, `RunsMetricsBarPlot.tsx`)
+2. **[Critical → Medium in newer versions]** Apply `lodash.escape()` to all user-controlled strings in Plotly hovertemplates (`RunsMetricsLinePlot.tsx`, `RunsContourPlot.tsx`, `RunsMetricsBarPlot.tsx`) — mitigated in newer MLflow by `useDefaultHoverBox={false}` but still recommended as defense-in-depth
 3. **[Critical]** Add URL protocol validation for `run_link` in `ModelVersionView.tsx` and dataset source URLs in `ExperimentViewDatasetSourceURL.tsx` — block `javascript:`, `data:`, `vbscript:`
 4. **[High]** Add Content-Security-Policy header in `security.py` / `fastapi_security.py`
 5. **[High]** Upgrade `sanitize-html` from `^1.18.5` to latest 2.x
