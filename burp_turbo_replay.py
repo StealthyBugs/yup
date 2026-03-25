@@ -1,22 +1,20 @@
+# -*- coding: utf-8 -*-
 # Burp Suite Extension: Turbo Replay
 # Jython-compatible Python extension that monitors proxy traffic,
 # collects unique endpoints, mutates requests, and replays them
 # at high concurrency (Turbo Intruder-style).
 
-from burp import IBurpExtender, IProxyListener, ITab, IHttpListener
+from burp import IBurpExtender, IProxyListener, ITab
 from javax.swing import (
     JPanel, JTable, JScrollPane, JButton, JLabel, JTextField,
-    JTextArea, BorderFactory, SwingUtilities, SwingWorker,
+    JTextArea, BorderFactory, SwingUtilities,
     ListSelectionModel, BoxLayout, Box
 )
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
-from java.awt import BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, Insets, Font, Color, Dimension
+from java.awt import BorderLayout, FlowLayout, Font, Color, Dimension
 from java.lang import Runnable, String, Integer
-from java.net import URL
-from java.util.concurrent import Executors, CountDownLatch, atomic
+from java.util.concurrent import Executors, CountDownLatch
 import threading
-import re
-import time
 from urlparse import urlparse
 
 
@@ -178,7 +176,7 @@ def build_smuggle_request(helpers, raw_request, http_service):
             new_headers.append("Content-Length: %d" % SMUGGLE_BODY_BYTES)
             has_cl = True
         elif lower.startswith("content-type:"):
-            # Keep content-type if present, or skip — keep it
+            # Keep content-type if present
             new_headers.append(h)
         else:
             new_headers.append(h)
@@ -293,7 +291,7 @@ class ReplayTask(object):
             (c, n) for c, n in entry.results.items() if c < 200 or c >= 300
         ]
         if anomalies:
-            flags = ", ".join("%s×%d" % (c, n) for c, n in anomalies)
+            flags = ", ".join("%sx%d" % (c, n) for c, n in anomalies)
             summary += "  ** ANOMALY: " + flags
 
         extender = self.extender
