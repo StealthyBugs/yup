@@ -14,7 +14,7 @@ from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 from java.awt import BorderLayout, FlowLayout, Font, Color, Dimension, GridLayout
 from java.lang import Runnable, String, Integer
 from java.net import URL
-from java.util.concurrent import Executors
+from java.util.concurrent import Executors, CountDownLatch, LinkedBlockingQueue
 import threading
 from urlparse import urlparse
 
@@ -118,6 +118,7 @@ class EndpointEntry(object):
         self.error_msg = ""
         self.baseline_code = None
         self.baseline_length = None
+        self.baseline_response = None  # IHttpRequestResponse for the baseline
 
 
 # ---------------------------------------------------------------------------
@@ -294,11 +295,12 @@ class ReplayTask(object):
         self.row = row_index
 
     def run(self):
-        """Runs on a single worker thread. Sends all replay_count requests
-        to this one endpoint sequentially, back-to-back. Multiple workers
-        run different endpoints in parallel up to the global thread pool
-        size, but within a single endpoint everything is serial on one
-        thread for maximum per-host request rate (desync-friendly)."""
+        """Orchestrator thread: processes ONE endpoint at a time. For the
+        current endpoint, the shared thread pool is used to fire all N-1
+        replay requests in parallel against that single host. When the
+        endpoint finishes, the next one starts -- so at any moment all
+        threads are focused on one host (desync-friendly, max per-host
+        request rate)."""
         entry = self.entry
         helpers = self.extender._helpers
         callbacks = self.extender._callbacks
@@ -321,16 +323,18 @@ class ReplayTask(object):
 
         # --- Baseline: first request establishes expected response ---
         try:
-            baseline_resp = callbacks.makeHttpRequest(
+            baseline_rr = callbacks.makeHttpRequest(
                 entry.http_service, modified
             )
-            baseline_bytes = baseline_resp.getResponse()
+            baseline_bytes = baseline_rr.getResponse()
             code, body_len = parse_final_status(baseline_bytes, helpers)
             entry.baseline_code = code
             entry.baseline_length = body_len
+            entry.baseline_response = baseline_rr
         except Exception:
             entry.baseline_code = -1
             entry.baseline_length = 0
+            entry.baseline_response = None
 
         self._update_ui()
         self.extender._log_on_edt(
@@ -338,29 +342,57 @@ class ReplayTask(object):
             % (entry.path, entry.baseline_code, entry.baseline_length)
         )
 
-        # --- Sequential replay on THIS thread (no inner pool) ---
+        # --- Fire all remaining requests concurrently on shared pool ---
         remaining = entry.replay_count - 1
         results = {entry.baseline_code: 1}
         flagged_responses = []
+        mismatch_samples = {}  # code -> first IHttpRequestResponse
+        results_lock = threading.Lock()
 
-        for _ in range(remaining):
-            try:
-                resp = callbacks.makeHttpRequest(entry.http_service, modified)
-                resp_bytes = resp.getResponse()
-                code, _body_len = parse_final_status(resp_bytes, helpers)
-                results[code] = results.get(code, 0) + 1
-                if (flag_code is not None
-                        and code == flag_code
-                        and code != entry.baseline_code):
-                    flagged_responses.append(resp)
-            except Exception:
-                results[-1] = results.get(-1, 0) + 1
+        baseline_code = entry.baseline_code
+        extender = self.extender
+
+        if remaining > 0:
+            pool = extender._pool  # already sized correctly
+            latch = CountDownLatch(remaining)
+
+            class SendOne(Runnable):
+                def run(self_inner):
+                    try:
+                        rr = callbacks.makeHttpRequest(
+                            entry.http_service, modified
+                        )
+                        resp_bytes = rr.getResponse()
+                        code, _body_len = parse_final_status(resp_bytes, helpers)
+                        with results_lock:
+                            results[code] = results.get(code, 0) + 1
+                            if code != baseline_code and code not in mismatch_samples:
+                                mismatch_samples[code] = rr
+                            if (flag_code is not None
+                                    and code == flag_code
+                                    and code != baseline_code):
+                                flagged_responses.append(rr)
+                    except Exception:
+                        with results_lock:
+                            results[-1] = results.get(-1, 0) + 1
+                    finally:
+                        latch.countDown()
+
+            for _ in range(remaining):
+                pool.submit(SendOne())
+
+            latch.await()
 
         entry.results = results
         entry.status = STATUS_COMPLETED
         self._update_ui()
         self._log_result()
 
+        # Medium severity issue: any baseline mismatch
+        if mismatch_samples:
+            self._raise_mismatch_issue(entry, mismatch_samples)
+
+        # High severity issue: specific flag code appeared
         if flagged_responses:
             self._raise_scan_issue(entry, flag_code, flagged_responses)
 
@@ -411,6 +443,88 @@ class ReplayTask(object):
             "** HIGH SEVERITY ISSUE RAISED ** %s  |  "
             "Flagged code %d appeared %d time(s) (baseline was %d)"
             % (entry.path, flag_code, count, entry.baseline_code)
+        )
+
+    def _raise_mismatch_issue(self, entry, mismatch_samples):
+        """Medium severity: any response code that differs from the
+        baseline. Attaches the baseline response plus one sample of
+        each distinct mismatch response to the Burp issue."""
+        callbacks = self.extender._callbacks
+
+        protocol = str(entry.http_service.getProtocol())
+        host = str(entry.http_service.getHost())
+        port = entry.http_service.getPort()
+        url = URL(protocol, host, port, entry.path)
+
+        total = sum(entry.results.values())
+        baseline_hits = entry.results.get(entry.baseline_code, 0)
+        mismatch_total = total - baseline_hits
+
+        breakdown = ", ".join(
+            "%d: %d" % (c, n) for c, n in sorted(entry.results.items())
+        )
+        mismatch_codes = ", ".join(
+            "%d (x%d)" % (c, entry.results.get(c, 0))
+            for c in sorted(mismatch_samples.keys())
+        )
+
+        detail = (
+            "<b>Turbo Replay - Baseline Mismatch Detected</b><br><br>"
+            "Endpoint: <b>%s</b><br>"
+            "Baseline status code: <b>%d</b> (%d bytes body)<br>"
+            "Total replays: <b>%d</b><br>"
+            "Matched baseline: <b>%d</b><br>"
+            "Did NOT match baseline: <b>%d</b><br>"
+            "Mismatch codes: <b>%s</b><br><br>"
+            "Full status code breakdown: %s<br><br>"
+            "Not all %d replays returned the baseline response. "
+            "Inconsistent responses under identical requests can "
+            "indicate HTTP request smuggling, desync, or other race/"
+            "state-dependent behavior.<br><br>"
+            "<i>Attached messages: the baseline response first, "
+            "followed by one sample for each distinct mismatching "
+            "status code.</i>"
+            % (
+                entry.path,
+                entry.baseline_code,
+                entry.baseline_length,
+                total,
+                baseline_hits,
+                mismatch_total,
+                mismatch_codes,
+                breakdown,
+                total,
+            )
+        )
+
+        # Build attachment list: baseline first, then one sample per
+        # distinct mismatch code (sorted for deterministic ordering)
+        messages = []
+        if entry.baseline_response is not None:
+            messages.append(entry.baseline_response)
+        for code in sorted(mismatch_samples.keys()):
+            messages.append(mismatch_samples[code])
+
+        issue = TurboReplayIssue(
+            http_service=entry.http_service,
+            url=url,
+            http_messages=messages,
+            name="Turbo Replay: Baseline Mismatch on %s" % entry.path,
+            detail=detail,
+            severity="Medium",
+        )
+        callbacks.addScanIssue(issue)
+
+        self.extender._log_on_edt(
+            "** MEDIUM SEVERITY ISSUE RAISED ** %s  |  "
+            "%d/%d replays did not match baseline %d (mismatch codes: %s)"
+            % (
+                entry.path,
+                mismatch_total,
+                total,
+                entry.baseline_code,
+                mismatch_codes,
+            )
         )
 
     def _update_ui(self):
@@ -471,6 +585,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._pool = None
         self._pool_size = 0
         self._pool_lock = threading.Lock()
+        self._work_queue = LinkedBlockingQueue()
+        self._master_thread = None
+        self._master_lock = threading.Lock()
 
         # Tool flag constants from IBurpExtenderCallbacks
         self.TOOL_PROXY = callbacks.TOOL_PROXY
@@ -751,16 +868,38 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._log_area.setText("")
 
     def _launch_replay(self, entry, row):
-        """Submit this endpoint to the shared worker pool. One worker
-        thread will handle ALL of its replay requests sequentially."""
+        """Enqueue this endpoint. A single orchestrator thread pulls
+        from the queue and runs endpoints ONE AT A TIME. For each
+        endpoint the whole shared thread pool is used to fire its N
+        replay requests in parallel (all threads focused on one host)
+        before moving on to the next."""
         self._ensure_pool()
-        task = ReplayTask(self, entry, row)
+        self._ensure_master_running()
+        self._work_queue.put((entry, row))
 
-        class Worker(Runnable):
-            def run(self_inner):
-                task.run()
+    def _ensure_master_running(self):
+        with self._master_lock:
+            if self._master_thread is None or not self._master_thread.isAlive():
+                t = threading.Thread(target=self._master_loop)
+                t.daemon = True
+                self._master_thread = t
+                t.start()
 
-        self._pool.submit(Worker())
+    def _master_loop(self):
+        while True:
+            item = self._work_queue.take()  # blocks until available
+            try:
+                entry, row = item
+                # Re-check size in case thread_count changed
+                self._ensure_pool()
+                ReplayTask(self, entry, row).run()
+            except Exception as ex:
+                try:
+                    self._callbacks.printError(
+                        "Turbo Replay master loop error: %s" % str(ex)
+                    )
+                except Exception:
+                    pass
 
     def _log_on_edt(self, msg):
         log_area = self._log_area
