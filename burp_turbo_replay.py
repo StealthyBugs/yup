@@ -52,6 +52,57 @@ def normalize_path(raw_url):
 
 
 # ---------------------------------------------------------------------------
+# Helper: parse the final status code from a raw response, skipping any
+# leading 1xx interim responses (e.g. "100 Continue" before "400 Bad Req")
+# ---------------------------------------------------------------------------
+def parse_final_status(resp_bytes, helpers):
+    """Return (status_code, body_length) for the FINAL response in the
+    byte stream. If the stream begins with a 1xx interim response
+    (e.g. HTTP/1.1 100 Continue), skip past it and parse the next
+    response -- which is what the client would actually consume.
+    Returns (0, 0) if no response / empty bytes."""
+    if not resp_bytes:
+        return (0, 0)
+
+    # Let Burp parse the first response
+    analyzed = helpers.analyzeResponse(resp_bytes)
+    first_code = analyzed.getStatusCode()
+    first_body_offset = analyzed.getBodyOffset()
+
+    # Common case: not a 1xx, so this IS the final response
+    if first_code < 100 or first_code >= 200:
+        return (first_code, len(resp_bytes) - first_body_offset)
+
+    # 1xx interim: scan for the next "HTTP/1." status line after it
+    # For 1xx, the body is empty and the next response begins immediately
+    # after the header block's trailing CRLF CRLF.
+    tail = resp_bytes[first_body_offset:]
+    if not tail:
+        return (first_code, 0)
+
+    try:
+        tail_str = helpers.bytesToString(tail)
+    except Exception:
+        return (first_code, 0)
+
+    # Find where the next response begins
+    idx = tail_str.find("HTTP/")
+    if idx == -1:
+        # No follow-up response found - return the 1xx as-is
+        return (first_code, 0)
+
+    # Re-analyze from that offset
+    try:
+        follow_up_bytes = tail[idx:]
+        analyzed2 = helpers.analyzeResponse(follow_up_bytes)
+        final_code = analyzed2.getStatusCode()
+        final_body_offset = analyzed2.getBodyOffset()
+        return (final_code, len(follow_up_bytes) - final_body_offset)
+    except Exception:
+        return (first_code, 0)
+
+
+# ---------------------------------------------------------------------------
 # Data model for one endpoint
 # ---------------------------------------------------------------------------
 class EndpointEntry(object):
@@ -274,14 +325,9 @@ class ReplayTask(object):
                 entry.http_service, modified
             )
             baseline_bytes = baseline_resp.getResponse()
-            if baseline_bytes:
-                analyzed_bl = helpers.analyzeResponse(baseline_bytes)
-                entry.baseline_code = analyzed_bl.getStatusCode()
-                body_offset = analyzed_bl.getBodyOffset()
-                entry.baseline_length = len(baseline_bytes) - body_offset
-            else:
-                entry.baseline_code = 0
-                entry.baseline_length = 0
+            code, body_len = parse_final_status(baseline_bytes, helpers)
+            entry.baseline_code = code
+            entry.baseline_length = body_len
         except Exception:
             entry.baseline_code = -1
             entry.baseline_length = 0
@@ -301,11 +347,7 @@ class ReplayTask(object):
             try:
                 resp = callbacks.makeHttpRequest(entry.http_service, modified)
                 resp_bytes = resp.getResponse()
-                if resp_bytes:
-                    analyzed_resp = helpers.analyzeResponse(resp_bytes)
-                    code = analyzed_resp.getStatusCode()
-                else:
-                    code = 0
+                code, _body_len = parse_final_status(resp_bytes, helpers)
                 results[code] = results.get(code, 0) + 1
                 if (flag_code is not None
                         and code == flag_code
