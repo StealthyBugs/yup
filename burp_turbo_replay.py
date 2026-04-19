@@ -14,7 +14,7 @@ from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 from java.awt import BorderLayout, FlowLayout, Font, Color, Dimension, GridLayout
 from java.lang import Runnable, String, Integer
 from java.net import URL
-from java.util.concurrent import Executors, CountDownLatch
+from java.util.concurrent import Executors
 import threading
 from urlparse import urlparse
 
@@ -243,6 +243,11 @@ class ReplayTask(object):
         self.row = row_index
 
     def run(self):
+        """Runs on a single worker thread. Sends all replay_count requests
+        to this one endpoint sequentially, back-to-back. Multiple workers
+        run different endpoints in parallel up to the global thread pool
+        size, but within a single endpoint everything is serial on one
+        thread for maximum per-host request rate (desync-friendly)."""
         entry = self.entry
         helpers = self.extender._helpers
         callbacks = self.extender._callbacks
@@ -263,7 +268,7 @@ class ReplayTask(object):
         entry.status = STATUS_RUNNING
         self._update_ui()
 
-        # --- Send the first request as baseline ---
+        # --- Baseline: first request establishes expected response ---
         try:
             baseline_resp = callbacks.makeHttpRequest(
                 entry.http_service, modified
@@ -287,61 +292,35 @@ class ReplayTask(object):
             % (entry.path, entry.baseline_code, entry.baseline_length)
         )
 
-        # --- Replay remaining requests concurrently ---
+        # --- Sequential replay on THIS thread (no inner pool) ---
         remaining = entry.replay_count - 1
-        if remaining < 1:
-            entry.results[entry.baseline_code] = 1
-            entry.status = STATUS_COMPLETED
-            self._update_ui()
-            self._log_result()
-            return
-
         results = {entry.baseline_code: 1}
-        thread_count = self.extender.thread_count
-        pool = Executors.newFixedThreadPool(thread_count)
-        latch = CountDownLatch(remaining)
-        results_lock = threading.Lock()
         flagged_responses = []
 
-        baseline_code = entry.baseline_code
-        flag_code_val = flag_code
-
-        class SendOne(Runnable):
-            def run(self_inner):
-                try:
-                    resp = callbacks.makeHttpRequest(
-                        entry.http_service, modified
-                    )
-                    resp_bytes = resp.getResponse()
-                    if resp_bytes:
-                        analyzed_resp = helpers.analyzeResponse(resp_bytes)
-                        code = analyzed_resp.getStatusCode()
-                    else:
-                        code = 0
-                    with results_lock:
-                        results[code] = results.get(code, 0) + 1
-                        if flag_code_val is not None and code == flag_code_val and code != baseline_code:
-                            flagged_responses.append(resp)
-                except Exception:
-                    with results_lock:
-                        results[-1] = results.get(-1, 0) + 1
-                finally:
-                    latch.countDown()
-
         for _ in range(remaining):
-            pool.submit(SendOne())
-
-        latch.await()
-        pool.shutdown()
+            try:
+                resp = callbacks.makeHttpRequest(entry.http_service, modified)
+                resp_bytes = resp.getResponse()
+                if resp_bytes:
+                    analyzed_resp = helpers.analyzeResponse(resp_bytes)
+                    code = analyzed_resp.getStatusCode()
+                else:
+                    code = 0
+                results[code] = results.get(code, 0) + 1
+                if (flag_code is not None
+                        and code == flag_code
+                        and code != entry.baseline_code):
+                    flagged_responses.append(resp)
+            except Exception:
+                results[-1] = results.get(-1, 0) + 1
 
         entry.results = results
         entry.status = STATUS_COMPLETED
         self._update_ui()
         self._log_result()
 
-        # --- Raise Burp issue if flagged code appeared ---
         if flagged_responses:
-            self._raise_scan_issue(entry, flag_code_val, flagged_responses)
+            self._raise_scan_issue(entry, flag_code, flagged_responses)
 
     def _raise_scan_issue(self, entry, flag_code, flagged_responses):
         helpers = self.extender._helpers
@@ -447,6 +426,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._seen_paths = {}
         self._seen_lock = threading.Lock()
         self.thread_count = DEFAULT_THREAD_COUNT
+        self._pool = None
+        self._pool_size = 0
+        self._pool_lock = threading.Lock()
 
         # Tool flag constants from IBurpExtenderCallbacks
         self.TOOL_PROXY = callbacks.TOOL_PROXY
@@ -562,6 +544,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
         top.add(JLabel("  Threads:"))
         self._thread_field = JTextField(str(DEFAULT_THREAD_COUNT), 4)
+        self._thread_field.setToolTipText(
+            "Number of endpoints processed in parallel. Each worker "
+            "thread sends all N replay requests to one endpoint "
+            "sequentially, back-to-back (desync-friendly)."
+        )
         top.add(self._thread_field)
 
         top.add(JLabel("  Flag Code:"))
@@ -682,9 +669,23 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             tc = int(self._thread_field.getText().strip())
             if tc < 1:
                 tc = DEFAULT_THREAD_COUNT
-            self.thread_count = tc
         except (ValueError, TypeError):
-            self.thread_count = DEFAULT_THREAD_COUNT
+            tc = DEFAULT_THREAD_COUNT
+        self.thread_count = tc
+        self._ensure_pool()
+
+    def _ensure_pool(self):
+        """Create the shared worker pool lazily, or replace it if the
+        user changed the thread count. Each worker processes one whole
+        endpoint at a time (all N requests sequentially on that thread)."""
+        with self._pool_lock:
+            if self._pool is None or self._pool_size != self.thread_count:
+                old = self._pool
+                self._pool = Executors.newFixedThreadPool(self.thread_count)
+                self._pool_size = self.thread_count
+                if old is not None:
+                    # Let in-flight tasks finish on the old pool; no new submits
+                    old.shutdown()
 
     def _on_start_all(self, event):
         self._read_thread_count()
@@ -708,10 +709,16 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._log_area.setText("")
 
     def _launch_replay(self, entry, row):
+        """Submit this endpoint to the shared worker pool. One worker
+        thread will handle ALL of its replay requests sequentially."""
+        self._ensure_pool()
         task = ReplayTask(self, entry, row)
-        t = threading.Thread(target=task.run)
-        t.daemon = True
-        t.start()
+
+        class Worker(Runnable):
+            def run(self_inner):
+                task.run()
+
+        self._pool.submit(Worker())
 
     def _log_on_edt(self, msg):
         log_area = self._log_area
