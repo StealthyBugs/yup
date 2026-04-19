@@ -10,7 +10,7 @@ from java.awt import BorderLayout, FlowLayout, Font, Color, Dimension
 from java.lang import Runnable, String, Integer, Thread as JThread
 from java.net import Socket, URL
 from java.io import BufferedInputStream, BufferedOutputStream, ByteArrayOutputStream
-from java.util.concurrent import CountDownLatch, LinkedBlockingQueue
+from java.util.concurrent import CountDownLatch, LinkedBlockingQueue, Executors
 from javax.net.ssl import SSLContext, X509TrustManager
 import jarray
 import threading
@@ -23,6 +23,31 @@ STATUS_COMPLETED = "Completed"
 STATUS_ERROR = "Error"
 DEFAULT_REPLAY_COUNT = 100
 DEFAULT_CONNECTIONS = 100
+MAX_LOG_LINES = 2000
+
+# Shared trust-all SSL context (created once, reused for all sockets)
+_SSL_CTX = None
+_SSL_CTX_LOCK = threading.Lock()
+
+
+def _get_ssl_context():
+    global _SSL_CTX
+    if _SSL_CTX is not None:
+        return _SSL_CTX
+    with _SSL_CTX_LOCK:
+        if _SSL_CTX is not None:
+            return _SSL_CTX
+        class TrustAll(X509TrustManager):
+            def checkClientTrusted(self, chain, authType):
+                pass
+            def checkServerTrusted(self, chain, authType):
+                pass
+            def getAcceptedIssuers(self):
+                return None
+        ctx = SSLContext.getInstance("TLS")
+        ctx.init(None, [TrustAll()], None)
+        _SSL_CTX = ctx
+        return ctx
 
 
 def normalize_path(raw_url):
@@ -130,15 +155,7 @@ def read_single_response(bis):
 
 def create_raw_socket(host, port, use_ssl):
     if use_ssl:
-        class TrustAll(X509TrustManager):
-            def checkClientTrusted(self, chain, authType):
-                pass
-            def checkServerTrusted(self, chain, authType):
-                pass
-            def getAcceptedIssuers(self):
-                return None
-        ctx = SSLContext.getInstance("TLS")
-        ctx.init(None, [TrustAll()], None)
+        ctx = _get_ssl_context()
         sock = ctx.getSocketFactory().createSocket(host, port)
         sock.startHandshake()
     else:
@@ -386,17 +403,19 @@ class ReplayTask(object):
             entry.status = STATUS_COMPLETED
             self._update_ui()
             self._log_result()
+            self._release_entry(entry)
             return
         host = str(entry.http_service.getHost())
         port = entry.http_service.getPort()
         use_ssl = str(entry.http_service.getProtocol()).lower() == "https"
         baseline_code = entry.baseline_code
-        # Convert modified request to raw bytes for socket
         raw_bytes = bytearray(modified)
         latch = CountDownLatch(remaining)
+        pool = self.extender._get_pool()
 
         class RawSender(Runnable):
             def run(self_inner):
+                sock = None
                 try:
                     sock = create_raw_socket(host, port, use_ssl)
                     out = BufferedOutputStream(sock.getOutputStream())
@@ -404,10 +423,6 @@ class ReplayTask(object):
                     out.write(raw_bytes)
                     out.flush()
                     code, resp_bytes = read_single_response(inp)
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
                     with results_lock:
                         results[code] = results.get(code, 0) + 1
                         if code != baseline_code and code not in mismatch_samples:
@@ -420,12 +435,15 @@ class ReplayTask(object):
                     with results_lock:
                         results[-1] = results.get(-1, 0) + 1
                 finally:
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
                     latch.countDown()
 
         for _ in range(remaining):
-            t = JThread(RawSender())
-            t.setDaemon(True)
-            t.start()
+            pool.submit(RawSender())
         latch.await()
         entry.results = results
         entry.status = STATUS_COMPLETED
@@ -435,6 +453,12 @@ class ReplayTask(object):
             self._raise_mismatch_issue(entry, mismatch_samples)
         if flagged_responses:
             self._raise_scan_issue(entry, flag_code, flagged_responses)
+        self._release_entry(entry)
+
+    def _release_entry(self, entry):
+        """Drop heavy references after processing so GC can reclaim memory."""
+        entry.raw_request = None
+        entry.baseline_response = None
 
     def _raise_scan_issue(self, entry, flag_code, flagged_responses):
         callbacks = self.extender._callbacks
@@ -545,6 +569,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._work_queue = LinkedBlockingQueue()
         self._master_thread = None
         self._master_lock = threading.Lock()
+        self._pool = None
+        self._pool_size = 0
+        self._pool_lock = threading.Lock()
+        self._log_line_count = 0
+        self._completed_count = 0
         self.TOOL_PROXY = callbacks.TOOL_PROXY
         self.TOOL_INTRUDER = callbacks.TOOL_INTRUDER
         self.table_model = EndpointTableModel()
@@ -722,6 +751,15 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._ensure_master_running()
         self._work_queue.put((entry, row))
 
+    def _get_pool(self):
+        with self._pool_lock:
+            if self._pool is None or self._pool_size != self.connection_count:
+                if self._pool is not None:
+                    self._pool.shutdown()
+                self._pool = Executors.newFixedThreadPool(self.connection_count)
+                self._pool_size = self.connection_count
+            return self._pool
+
     def _ensure_master_running(self):
         with self._master_lock:
             if self._master_thread is None or not self._master_thread.isAlive():
@@ -734,17 +772,56 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         while True:
             try:
                 entry, row = self._work_queue.take()
+                self._read_connection_count()
                 ReplayTask(self, entry, row).run()
+                self._completed_count += 1
+                # Periodically trim completed entries from the table to free memory
+                if self._completed_count % 500 == 0:
+                    self._trim_completed_entries()
             except Exception as ex:
                 try:
                     self._callbacks.printError("Turbo Replay error: %s" % str(ex))
                 except Exception:
                     pass
 
+    def _trim_completed_entries(self):
+        """Remove old completed/error entries from the table to prevent
+        unbounded memory growth over tens of thousands of targets."""
+        model = self.table_model
+        keep_last = 200
+        with model._lock:
+            # Count completed entries
+            completed = [i for i, e in enumerate(model.entries)
+                         if e.status in (STATUS_COMPLETED, STATUS_ERROR)]
+            if len(completed) <= keep_last:
+                return
+            remove_count = len(completed) - keep_last
+            to_remove = set(completed[:remove_count])
+            new_entries = [e for i, e in enumerate(model.entries)
+                           if i not in to_remove]
+            model.entries = new_entries
+
+        class Refresh(Runnable):
+            def run(self_inner):
+                model.fireTableDataChanged()
+        SwingUtilities.invokeLater(Refresh())
+
     def _log_on_edt(self, msg):
         log_area = self._log_area
+        extender = self
+
         class Logger(Runnable):
             def run(self_inner):
+                extender._log_line_count += 1
+                # Truncate log when it gets too large
+                if extender._log_line_count > MAX_LOG_LINES:
+                    text = log_area.getText()
+                    # Keep last half of lines
+                    lines = text.split("\n")
+                    if len(lines) > MAX_LOG_LINES // 2:
+                        trimmed = "\n".join(lines[-(MAX_LOG_LINES // 2):])
+                        log_area.setText(trimmed)
+                        extender._log_line_count = MAX_LOG_LINES // 2
                 log_area.append(msg + "\n")
                 log_area.setCaretPosition(log_area.getDocument().getLength())
         SwingUtilities.invokeLater(Logger())
