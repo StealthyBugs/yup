@@ -4,10 +4,10 @@
 # collects unique endpoints, mutates requests, and replays them
 # at high concurrency (Turbo Intruder-style).
 
-from burp import IBurpExtender, IProxyListener, ITab, IScanIssue
+from burp import IBurpExtender, IHttpListener, ITab, IScanIssue
 from javax.swing import (
     JPanel, JTable, JScrollPane, JButton, JLabel, JTextField,
-    JTextArea, BorderFactory, SwingUtilities,
+    JTextArea, BorderFactory, SwingUtilities, JCheckBox,
     ListSelectionModel, BoxLayout, Box, JSplitPane
 )
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
@@ -437,7 +437,7 @@ class ReplayTask(object):
 # ---------------------------------------------------------------------------
 # Main extension class
 # ---------------------------------------------------------------------------
-class BurpExtender(IBurpExtender, IProxyListener, ITab):
+class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
@@ -448,10 +448,14 @@ class BurpExtender(IBurpExtender, IProxyListener, ITab):
         self._seen_lock = threading.Lock()
         self.thread_count = DEFAULT_THREAD_COUNT
 
+        # Tool flag constants from IBurpExtenderCallbacks
+        self.TOOL_PROXY = callbacks.TOOL_PROXY
+        self.TOOL_INTRUDER = callbacks.TOOL_INTRUDER
+
         self.table_model = EndpointTableModel()
         self._build_ui()
 
-        callbacks.registerProxyListener(self)
+        callbacks.registerHttpListener(self)
         callbacks.addSuiteTab(self)
         callbacks.printOutput("Turbo Replay extension loaded.")
 
@@ -479,14 +483,25 @@ class BurpExtender(IBurpExtender, IProxyListener, ITab):
         except (ValueError, TypeError):
             return None
 
-    # --- IProxyListener ---
-    def processProxyMessage(self, is_request, message):
-        if not is_request:
+    # --- IHttpListener ---
+    def processHttpMessage(self, tool_flag, message_is_request, message_info):
+        if not message_is_request:
             return
 
-        msg_info = message.getMessageInfo()
-        request_bytes = msg_info.getRequest()
-        http_service = msg_info.getHttpService()
+        # Filter by tool source based on UI checkboxes
+        if tool_flag == self.TOOL_PROXY:
+            if not self._proxy_cb.isSelected():
+                return
+        elif tool_flag == self.TOOL_INTRUDER:
+            if not self._intruder_cb.isSelected():
+                return
+        else:
+            return  # ignore other tools (repeater, scanner, etc.)
+
+        request_bytes = message_info.getRequest()
+        http_service = message_info.getHttpService()
+        if http_service is None or request_bytes is None:
+            return
 
         analyzed = self._helpers.analyzeRequest(http_service, request_bytes)
         url = analyzed.getUrl()
@@ -519,15 +534,19 @@ class BurpExtender(IBurpExtender, IProxyListener, ITab):
             http_service=http_service,
         )
 
+        extender = self
+        model = self.table_model
+        auto_run = self._autorun_cb.isSelected()
+
         class AddRow(Runnable):
-            def __init__(self_inner, model, entry):
-                self_inner.model = model
-                self_inner.entry = entry
-
             def run(self_inner):
-                self_inner.model.add_entry(self_inner.entry)
+                model.add_entry(entry)
+                if auto_run:
+                    row = len(model.entries) - 1
+                    extender._read_thread_count()
+                    extender._launch_replay(entry, row)
 
-        SwingUtilities.invokeLater(AddRow(self.table_model, entry))
+        SwingUtilities.invokeLater(AddRow())
 
     # --- UI construction ---
     def _build_ui(self):
@@ -564,7 +583,29 @@ class BurpExtender(IBurpExtender, IProxyListener, ITab):
         btn_clear = JButton("Clear", actionPerformed=self._on_clear)
         top.add(btn_clear)
 
-        self._main_panel.add(top, BorderLayout.NORTH)
+        # --- Second row: source checkboxes ---
+        options = JPanel(FlowLayout(FlowLayout.LEFT, 8, 2))
+
+        self._proxy_cb = JCheckBox("Proxy traffic", True)
+        self._proxy_cb.setToolTipText("Collect endpoints from Burp Proxy")
+        options.add(self._proxy_cb)
+
+        self._intruder_cb = JCheckBox("Intruder traffic", True)
+        self._intruder_cb.setToolTipText("Collect endpoints from Burp Intruder")
+        options.add(self._intruder_cb)
+
+        options.add(Box.createHorizontalStrut(20))
+
+        self._autorun_cb = JCheckBox("Auto-run on new endpoints", False)
+        self._autorun_cb.setToolTipText(
+            "Automatically replay each new endpoint as soon as it's discovered"
+        )
+        options.add(self._autorun_cb)
+
+        top_wrapper = JPanel(BorderLayout())
+        top_wrapper.add(top, BorderLayout.NORTH)
+        top_wrapper.add(options, BorderLayout.SOUTH)
+        self._main_panel.add(top_wrapper, BorderLayout.NORTH)
 
         # --- Center: table + body editor side by side above the log ---
         center = JPanel(BorderLayout(5, 5))
