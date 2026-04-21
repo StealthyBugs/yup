@@ -400,9 +400,17 @@ class ReplayTask(object):
         self._update_ui()
         self._log_result()
         if all_mismatch:
-            self._raise_mismatch_issue(entry, all_mismatch)
+            try:
+                self._raise_mismatch_issue(entry, all_mismatch)
+            except Exception as ex:
+                self.extender._log_on_edt(
+                    "** MISMATCH ISSUE ERROR ** %s: %s" % (entry.path, str(ex)))
         if all_flagged:
-            self._raise_scan_issue(entry, flag_code, all_flagged)
+            try:
+                self._raise_scan_issue(entry, flag_code, all_flagged)
+            except Exception as ex:
+                self.extender._log_on_edt(
+                    "** FLAG ISSUE ERROR ** %s: %s" % (entry.path, str(ex)))
         self._release_entry(entry)
 
     def _run_mutation(self, entry, mutation, body_str, flag_code):
@@ -506,7 +514,7 @@ class ReplayTask(object):
         detail = (
             "<b>Turbo Replay - Anomalous Status Code</b><br><br>"
             "Endpoint: <b>%s</b><br>"
-            "Baseline: <b>%d</b><br>"
+            "Baseline: <b>%s</b><br>"
             "Flagged code <b>%d</b> appeared <b>%d</b> time(s) "
             "out of %d replays.<br><br>"
             "Breakdown: %s"
@@ -536,14 +544,14 @@ class ReplayTask(object):
         detail = (
             "<b>Turbo Replay - Baseline Mismatch</b><br><br>"
             "Endpoint: <b>%s</b><br>"
-            "Baseline: <b>%d</b> (%d bytes body)<br>"
-            "Total: <b>%d</b> | Matched: <b>%d</b> | "
-            "Mismatched: <b>%d</b><br>"
+            "Baseline (last mutation): <b>%s</b> (%s bytes body)<br>"
+            "Total: <b>%d</b> | "
+            "Distinct mismatches: <b>%d</b><br>"
             "Mismatch codes: <b>%s</b><br>"
             "Breakdown: %s<br><br>"
             "Inconsistent responses may indicate desync."
             % (entry.path, entry.baseline_code, entry.baseline_length,
-               total, bl_hits, mm_total, mm_codes, breakdown))
+               total, mm_total, mm_codes, breakdown))
         messages = []
         if entry.baseline_response is not None:
             messages.append(entry.baseline_response)
