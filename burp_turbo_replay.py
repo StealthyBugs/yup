@@ -7,7 +7,7 @@ from javax.swing import (
 )
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 from java.awt import BorderLayout, FlowLayout, Font, Color, Dimension
-from java.lang import Runnable, String, Integer, Thread as JThread
+from java.lang import Runnable, String, Integer, Thread as JThread, System as JSystem
 from java.net import Socket, URL
 from java.io import BufferedInputStream, BufferedOutputStream, ByteArrayOutputStream
 from java.util.concurrent import CountDownLatch, LinkedBlockingQueue, Executors
@@ -347,9 +347,6 @@ def build_smuggle_request(helpers, raw_request, http_service, body_str, mutation
     parts[0] = method
     headers[0] = " ".join(parts)
     new_headers = [headers[0]]
-    has_expect = False
-    has_cl = False
-    has_te = False
     skip_headers = ["expect:", "content-length:", "transfer-encoding:", "connection:", "upgrade:", "http2-settings:"]
     for h in headers[1:]:
         lower = h.lower()
@@ -370,8 +367,16 @@ def build_smuggle_request(helpers, raw_request, http_service, body_str, mutation
         new_headers.append("Transfer-Encoding: chunked")
     else:
         new_headers.append("Content-Length: %d" % body_len)
+    # Build the raw HTTP message manually. Burp's helpers.buildHttpMessage()
+    # auto-adds a Content-Length header even when Transfer-Encoding is set,
+    # which breaks TE smuggling tests. Assemble the bytes ourselves.
+    header_str = "\r\n".join(new_headers) + "\r\n\r\n"
+    header_bytes = helpers.stringToBytes(header_str)
     body_bytes = helpers.stringToBytes(actual_body)
-    return helpers.buildHttpMessage(new_headers, body_bytes)
+    result = jarray.zeros(len(header_bytes) + len(body_bytes), 'b')
+    JSystem.arraycopy(header_bytes, 0, result, 0, len(header_bytes))
+    JSystem.arraycopy(body_bytes, 0, result, len(header_bytes), len(body_bytes))
+    return result
 
 
 def parse_final_status(resp_bytes, helpers):
