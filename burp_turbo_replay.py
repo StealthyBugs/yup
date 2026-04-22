@@ -426,36 +426,38 @@ class ReplayTask(object):
             return
         entry.status = STATUS_RUNNING
         self._update_ui()
-        # Run each selected mutation sequentially on this host
+        # Run each selected mutation sequentially on this host.
+        # Raise ONE issue per (endpoint, mutation) so each mutation's
+        # mismatch is reported separately in Burp's Issues tab.
         all_results = {}
-        all_mismatch = {}
-        all_flagged = []
         for mutation in mutations:
-            m_results, m_mismatch, m_flagged = self._run_mutation(
-                entry, mutation, body_str, flag_code)
-            # Merge results with mutation prefix for clarity
+            m_results, m_mismatch, m_flagged, m_baseline_code, m_baseline_len, m_baseline_rr = (
+                self._run_mutation(entry, mutation, body_str, flag_code))
             for code, cnt in m_results.items():
                 key = "%s:%s" % (mutation, code)
                 all_results[key] = cnt
-            for code, rr in m_mismatch.items():
-                all_mismatch["%s:%s" % (mutation, code)] = rr
-            all_flagged.extend(m_flagged)
+            if m_mismatch:
+                try:
+                    self._raise_mismatch_issue(
+                        entry, mutation, m_results, m_mismatch,
+                        m_baseline_code, m_baseline_len, m_baseline_rr)
+                except Exception as ex:
+                    self.extender._log_on_edt(
+                        "** MISMATCH ISSUE ERROR ** %s [%s]: %s"
+                        % (entry.path, mutation, str(ex)))
+            if m_flagged:
+                try:
+                    self._raise_scan_issue(
+                        entry, mutation, flag_code, m_flagged,
+                        m_results, m_baseline_code)
+                except Exception as ex:
+                    self.extender._log_on_edt(
+                        "** FLAG ISSUE ERROR ** %s [%s]: %s"
+                        % (entry.path, mutation, str(ex)))
         entry.results = all_results
         entry.status = STATUS_COMPLETED
         self._update_ui()
         self._log_result()
-        if all_mismatch:
-            try:
-                self._raise_mismatch_issue(entry, all_mismatch)
-            except Exception as ex:
-                self.extender._log_on_edt(
-                    "** MISMATCH ISSUE ERROR ** %s: %s" % (entry.path, str(ex)))
-        if all_flagged:
-            try:
-                self._raise_scan_issue(entry, flag_code, all_flagged)
-            except Exception as ex:
-                self.extender._log_on_edt(
-                    "** FLAG ISSUE ERROR ** %s: %s" % (entry.path, str(ex)))
         self._release_entry(entry)
 
     def _run_mutation(self, entry, mutation, body_str, flag_code):
@@ -468,7 +470,7 @@ class ReplayTask(object):
         except Exception as ex:
             self.extender._log_on_edt(
                 "[ERROR] %s %s build failed: %s" % (mutation, entry.path, str(ex)))
-            return ({-1: 1}, {}, [])
+            return ({-1: 1}, {}, [], -1, 0, None)
         # Baseline via Burp API
         try:
             bl_rr = callbacks.makeHttpRequest(entry.http_service, modified)
@@ -491,7 +493,7 @@ class ReplayTask(object):
         mismatch_samples = {}
         flagged_responses = []
         if remaining < 1:
-            return (results, mismatch_samples, flagged_responses)
+            return (results, mismatch_samples, flagged_responses, bl_code, bl_len, bl_rr)
         host = str(entry.http_service.getHost())
         port = entry.http_service.getPort()
         use_ssl = str(entry.http_service.getProtocol()).lower() == "https"
@@ -539,15 +541,15 @@ class ReplayTask(object):
             parts.append("%s: %d" % (code if code > 0 else "Err", cnt))
         self.extender._log_on_edt(
             "[%s] %s  |  %s" % (mutation, entry.path, ", ".join(parts)))
-        return (results, mismatch_samples, flagged_responses)
-        self._release_entry(entry)
+        return (results, mismatch_samples, flagged_responses, bl_code, bl_len, bl_rr)
 
     def _release_entry(self, entry):
         """Drop heavy references after processing so GC can reclaim memory."""
         entry.raw_request = None
         entry.baseline_response = None
 
-    def _raise_scan_issue(self, entry, flag_code, flagged_responses):
+    def _raise_scan_issue(self, entry, mutation, flag_code, flagged_responses,
+                          m_results, m_baseline_code):
         callbacks = self.extender._callbacks
         protocol = str(entry.http_service.getProtocol())
         host = str(entry.http_service.getHost())
@@ -555,62 +557,69 @@ class ReplayTask(object):
         url = URL(protocol, host, port, entry.path)
         count = len(flagged_responses)
         breakdown = ", ".join(
-            "%s: %d" % (k, n) for k, n in sorted(entry.results.items()))
+            "%s: %d" % (k, n) for k, n in sorted(m_results.items()))
         detail = (
-            "<b>Turbo Replay - Anomalous Status Code</b><br><br>"
+            "<b>Turbo Replay - Anomalous Status Code [%s]</b><br><br>"
             "Endpoint: <b>%s</b><br>"
+            "Mutation: <b>%s</b><br>"
             "Baseline: <b>%s</b><br>"
             "Flagged code <b>%d</b> appeared <b>%d</b> time(s) "
             "out of %d replays.<br><br>"
             "Breakdown: %s"
-            % (entry.path, entry.baseline_code, flag_code,
-               count, entry.replay_count, breakdown))
+            % (mutation, entry.path, mutation, m_baseline_code,
+               flag_code, count, entry.replay_count, breakdown))
         issue = TurboReplayIssue(
             http_service=entry.http_service, url=url,
             http_messages=flagged_responses,
-            name="Turbo Replay: Anomalous %d on %s" % (flag_code, entry.path),
+            name="Turbo Replay [%s]: Anomalous %d on %s"
+                 % (mutation, flag_code, entry.path),
             detail=detail, severity="High")
         callbacks.addScanIssue(issue)
         self.extender._log_on_edt(
-            "** HIGH ISSUE ** %s | code %d x%d (baseline %d)"
-            % (entry.path, flag_code, count, entry.baseline_code))
+            "** HIGH ISSUE ** [%s] %s | code %d x%d (baseline %s)"
+            % (mutation, entry.path, flag_code, count, m_baseline_code))
 
-    def _raise_mismatch_issue(self, entry, mismatch_samples):
+    def _raise_mismatch_issue(self, entry, mutation, m_results,
+                              mismatch_samples, m_baseline_code,
+                              m_baseline_len, m_baseline_rr):
         callbacks = self.extender._callbacks
         protocol = str(entry.http_service.getProtocol())
         host = str(entry.http_service.getHost())
         port = entry.http_service.getPort()
         url = URL(protocol, host, port, entry.path)
-        total = sum(entry.results.values())
-        mm_total = len(mismatch_samples)
+        total = sum(m_results.values())
+        bl_hits = m_results.get(m_baseline_code, 0)
+        mm_total = total - bl_hits
         breakdown = ", ".join(
-            "%s: %d" % (k, n) for k, n in sorted(entry.results.items()))
-        mm_codes = ", ".join(sorted(mismatch_samples.keys()))
+            "%s: %d" % (k, n) for k, n in sorted(m_results.items()))
+        mm_codes = ", ".join(str(c) for c in sorted(mismatch_samples.keys()))
         detail = (
-            "<b>Turbo Replay - Baseline Mismatch</b><br><br>"
+            "<b>Turbo Replay - Baseline Mismatch [%s]</b><br><br>"
             "Endpoint: <b>%s</b><br>"
-            "Baseline (last mutation): <b>%s</b> (%s bytes body)<br>"
-            "Total: <b>%d</b> | "
-            "Distinct mismatches: <b>%d</b><br>"
+            "Mutation: <b>%s</b><br>"
+            "Baseline: <b>%s</b> (%s bytes body)<br>"
+            "Total: <b>%d</b> | Matched: <b>%d</b> | "
+            "Mismatched: <b>%d</b><br>"
             "Mismatch codes: <b>%s</b><br>"
             "Breakdown: %s<br><br>"
             "Inconsistent responses may indicate desync."
-            % (entry.path, entry.baseline_code, entry.baseline_length,
-               total, mm_total, mm_codes, breakdown))
+            % (mutation, entry.path, mutation, m_baseline_code,
+               m_baseline_len, total, bl_hits, mm_total, mm_codes, breakdown))
         messages = []
-        if entry.baseline_response is not None:
-            messages.append(entry.baseline_response)
+        if m_baseline_rr is not None:
+            messages.append(m_baseline_rr)
         for c in sorted(mismatch_samples.keys()):
             messages.append(mismatch_samples[c])
         issue = TurboReplayIssue(
             http_service=entry.http_service, url=url,
             http_messages=messages,
-            name="Turbo Replay: Baseline Mismatch on %s" % entry.path,
+            name="Turbo Replay [%s]: Baseline Mismatch on %s"
+                 % (mutation, entry.path),
             detail=detail, severity="Medium")
         callbacks.addScanIssue(issue)
         self.extender._log_on_edt(
-            "** MEDIUM ISSUE ** %s | %d/%d mismatched (baseline %d, codes: %s)"
-            % (entry.path, mm_total, total, entry.baseline_code, mm_codes))
+            "** MEDIUM ISSUE ** [%s] %s | %d/%d mismatched (baseline %s, codes: %s)"
+            % (mutation, entry.path, mm_total, total, m_baseline_code, mm_codes))
 
     def _update_ui(self):
         model = self.extender.table_model
