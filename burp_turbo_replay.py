@@ -10,7 +10,7 @@ from java.awt import BorderLayout, FlowLayout, Font, Color, Dimension
 from java.lang import Runnable, String, Integer, Thread as JThread, System as JSystem
 from java.net import Socket, URL
 from java.io import BufferedInputStream, BufferedOutputStream, ByteArrayOutputStream
-from java.util.concurrent import CountDownLatch, LinkedBlockingQueue, Executors
+from java.util.concurrent import CountDownLatch, LinkedBlockingQueue, Executors, TimeUnit
 from javax.net.ssl import SSLContext, X509TrustManager
 import jarray
 import threading
@@ -546,12 +546,18 @@ class ReplayTask(object):
                     out.write(raw_bytes)
                     out.flush()
                     code, resp_bytes = read_single_response(inp)
+                    # Cap stored response to 4KB to avoid memory bloat
+                    if resp_bytes is not None and len(resp_bytes) > 4096:
+                        resp_bytes = resp_bytes[:4096]
                     with results_lock:
                         results[code] = results.get(code, 0) + 1
                         if code != baseline_code and code not in mismatch_samples:
                             mismatch_samples[code] = SyntheticHttpRequestResponse(
                                 modified, resp_bytes, entry.http_service)
-                        if flag_code is not None and code == flag_code and code != baseline_code:
+                        if (flag_code is not None
+                                and code == flag_code
+                                and code != baseline_code
+                                and len(flagged_responses) < 3):
                             flagged_responses.append(SyntheticHttpRequestResponse(
                                 modified, resp_bytes, entry.http_service))
                 except Exception:
@@ -567,7 +573,13 @@ class ReplayTask(object):
 
         for _ in range(remaining):
             pool.submit(RawSender())
-        latch.await()
+        # Timeout: 30s per request worst case, but cap at 120s total
+        timeout_secs = min(remaining * 30, 120)
+        finished = latch.await(timeout_secs, TimeUnit.SECONDS)
+        if not finished:
+            self.extender._log_on_edt(
+                "[TIMEOUT %s] %s  |  latch timed out after %ds, continuing"
+                % (mutation, entry.path, timeout_secs))
         # Log per-mutation summary
         parts = []
         for code, cnt in sorted(results.items()):
@@ -814,6 +826,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         row1.add(JButton("Start All", actionPerformed=self._on_start_all))
         row1.add(JButton("Start Selected", actionPerformed=self._on_start_selected))
         row1.add(JButton("Clear", actionPerformed=self._on_clear))
+        row1.add(JButton("Reset Stuck", actionPerformed=self._on_reset_stuck))
         top_wrapper.add(row1)
         row2 = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
         row2.add(JLabel("Sources:"))
@@ -919,6 +932,19 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.table_model.clear()
         self._log_area.setText("")
 
+    def _on_reset_stuck(self, event):
+        count = 0
+        for i, e in enumerate(self.table_model.entries):
+            if e.status == STATUS_RUNNING:
+                e.status = STATUS_ERROR
+                e.error_msg = "Manually reset"
+                count += 1
+        if count > 0:
+            self.table_model.fireTableDataChanged()
+            self._log_on_edt("Reset %d stuck entries to Error" % count)
+        else:
+            self._log_on_edt("No stuck entries found")
+
     def _launch_replay(self, entry, row):
         self._ensure_master_running()
         self._work_queue.put((entry, row))
@@ -945,10 +971,20 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             try:
                 entry, row = self._work_queue.take()
                 self._read_connection_count()
-                ReplayTask(self, entry, row).run()
+                try:
+                    ReplayTask(self, entry, row).run()
+                except Exception as ex:
+                    entry.status = STATUS_ERROR
+                    entry.error_msg = str(ex)
+                    self._log_on_edt(
+                        "[ERROR] %s: %s" % (entry.path, str(ex)))
+                # Ensure status is never left as Running
+                if entry.status == STATUS_RUNNING:
+                    entry.status = STATUS_ERROR
+                    entry.error_msg = "Task did not complete"
+                self.table_model.update_status(row)
                 self._completed_count += 1
-                # Periodically trim completed entries from the table to free memory
-                if self._completed_count % 500 == 0:
+                if self._completed_count % 100 == 0:
                     self._trim_completed_entries()
             except Exception as ex:
                 try:
@@ -960,7 +996,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         """Remove old completed/error entries from the table to prevent
         unbounded memory growth over tens of thousands of targets."""
         model = self.table_model
-        keep_last = 200
+        keep_last = 100
         with model._lock:
             # Count completed entries
             completed = [i for i, e in enumerate(model.entries)
