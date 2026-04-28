@@ -3,8 +3,9 @@ from burp import IBurpExtender, IHttpListener, ITab, IScanIssue, IHttpRequestRes
 from javax.swing import (
     JPanel, JTable, JScrollPane, JButton, JLabel, JTextField,
     JTextArea, BorderFactory, SwingUtilities, JCheckBox, JComboBox,
-    ListSelectionModel, BoxLayout, Box, JSplitPane
+    ListSelectionModel, BoxLayout, Box, JSplitPane, Timer
 )
+from java.awt.event import ActionListener
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 from java.awt import BorderLayout, FlowLayout, Font, Color, Dimension
 from java.lang import Runnable, String, Integer, Thread as JThread, System as JSystem
@@ -765,6 +766,11 @@ class ReplayTask(object):
             "Breakdown: %s"
             % (mutation, entry.path, mutation, m_baseline_code,
                flag_code, count, entry.replay_count, breakdown))
+        sig = (host, mutation, "flag", flag_code)
+        with self.extender._raised_issues_lock:
+            if sig in self.extender._raised_issues:
+                return
+            self.extender._raised_issues.add(sig)
         issue = TurboReplayIssue(
             http_service=entry.http_service, url=url,
             http_messages=flagged_responses,
@@ -810,6 +816,11 @@ class ReplayTask(object):
             messages.append(m_baseline_rr)
         for c in sorted(mismatch_samples.keys()):
             messages.append(mismatch_samples[c])
+        sig = (host, mutation, "attack_drift")
+        with self.extender._raised_issues_lock:
+            if sig in self.extender._raised_issues:
+                return
+            self.extender._raised_issues.add(sig)
         issue = TurboReplayIssue(
             http_service=entry.http_service, url=url,
             http_messages=messages,
@@ -853,6 +864,11 @@ class ReplayTask(object):
             messages.append(m_baseline_rr)
         for c in sorted(mismatch_samples.keys()):
             messages.append(mismatch_samples[c])
+        sig = (host, mutation, "normal_drift")
+        with self.extender._raised_issues_lock:
+            if sig in self.extender._raised_issues:
+                return
+            self.extender._raised_issues.add(sig)
         issue = TurboReplayIssue(
             http_service=entry.http_service, url=url,
             http_messages=messages,
@@ -895,13 +911,23 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._seen_paths = {}
         self._seen_lock = threading.Lock()
         self.connection_count = DEFAULT_CONNECTIONS
-        self._work_queue = LinkedBlockingQueue()
+        # Bounded queue: drop when full so auto-run can't freeze the IHttpListener thread
+        self._work_queue = LinkedBlockingQueue(2000)
         self._master_thread = None
         self._master_lock = threading.Lock()
         self._pool = None
         self._pool_size = 0
         self._pool_lock = threading.Lock()
         self._log_line_count = 0
+        # Issue deduplication: (host, mutation, severity) -> already raised
+        self._raised_issues = set()
+        self._raised_issues_lock = threading.Lock()
+        # Log throttling: producer threads append to _log_buf under _log_buf_lock
+        # an AWT Timer flushes the buffer to the JTextArea every 200ms in batches.
+        # This collapses ~3.8M EDT calls at scale into ~5/second.
+        from collections import deque
+        self._log_buf = deque()
+        self._log_buf_lock = threading.Lock()
         self._completed_count = 0
         self.TOOL_PROXY = callbacks.TOOL_PROXY
         self.TOOL_INTRUDER = callbacks.TOOL_INTRUDER
@@ -980,6 +1006,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         with self._seen_lock:
             if key in self._seen_paths:
                 return
+            # Bound the dedup dict to prevent unbounded growth across long sessions
+            if len(self._seen_paths) > 200000:
+                self._seen_paths.clear()
             self._seen_paths[key] = True
         try:
             default_count = int(self._replay_field.getText().strip())
@@ -1113,6 +1142,37 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         v_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, h_split, log_scroll)
         v_split.setResizeWeight(0.6)
         self._main_panel.add(v_split, BorderLayout.CENTER)
+        # Start the log flush timer (200ms) AFTER the log area is created.
+        extender = self
+        log_area = self._log_area
+
+        class LogFlush(ActionListener):
+            def actionPerformed(self_inner, evt):
+                with extender._log_buf_lock:
+                    if not extender._log_buf:
+                        return
+                    chunk = "\n".join(extender._log_buf) + "\n"
+                    extender._log_buf.clear()
+                doc = log_area.getDocument()
+                try:
+                    doc.insertString(doc.getLength(), chunk, None)
+                except Exception:
+                    return
+                extender._log_line_count += chunk.count("\n")
+                if extender._log_line_count > MAX_LOG_LINES:
+                    elem = doc.getDefaultRootElement()
+                    target_idx = MAX_LOG_LINES // 2 - 1
+                    if target_idx < elem.getElementCount():
+                        cut = elem.getElement(target_idx).getEndOffset()
+                        try:
+                            doc.remove(0, cut)
+                            extender._log_line_count = MAX_LOG_LINES // 2
+                        except Exception:
+                            pass
+                log_area.setCaretPosition(doc.getLength())
+
+        self._log_timer = Timer(200, LogFlush())
+        self._log_timer.start()
 
     def _read_connection_count(self):
         try:
@@ -1124,26 +1184,45 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
     def _on_start_all(self, event):
         self._read_connection_count()
-        for i, e in enumerate(self.table_model.entries):
-            if e.status in (STATUS_PENDING, STATUS_ERROR):
-                e.status = STATUS_PENDING
-                e.error_msg = ""
-                self._launch_replay(e, i)
+        # Snapshot entries on EDT, then enqueue from a background thread so
+        # we can use put() (blocking) without freezing the UI when the queue
+        # is full. This drains all pending/error entries without dropping any.
+        snap = list(enumerate(self.table_model.entries))
+        self._ensure_master_running()
+        t = threading.Thread(target=self._bulk_enqueue, args=(snap,))
+        t.daemon = True
+        t.start()
 
     def _on_start_selected(self, event):
         self._read_connection_count()
-        for r in self._table.getSelectedRows():
-            e = self.table_model.entries[r]
+        rows = list(self._table.getSelectedRows())
+        snap = [(r, self.table_model.entries[r]) for r in rows
+                if 0 <= r < len(self.table_model.entries)]
+        self._ensure_master_running()
+        t = threading.Thread(target=self._bulk_enqueue, args=(snap,))
+        t.daemon = True
+        t.start()
+
+    def _bulk_enqueue(self, snap):
+        for i, e in snap:
             if e.status in (STATUS_PENDING, STATUS_ERROR):
                 e.status = STATUS_PENDING
                 e.error_msg = ""
-                self._launch_replay(e, r)
+                # Blocking put: backpressure naturally throttles the loop.
+                # Safe here because we're in a daemon thread, NOT the EDT
+                # or Burp's IHttpListener thread.
+                self._work_queue.put((e, i))
 
     def _on_clear(self, event):
         with self._seen_lock:
             self._seen_paths.clear()
+        with self._raised_issues_lock:
+            self._raised_issues.clear()
+        with self._log_buf_lock:
+            self._log_buf.clear()
         self.table_model.clear()
         self._log_area.setText("")
+        self._log_line_count = 0
 
     def _on_reset_stuck(self, event):
         count = 0
@@ -1160,7 +1239,20 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
     def _launch_replay(self, entry, row):
         self._ensure_master_running()
-        self._work_queue.put((entry, row))
+        # Use offer() not put() - put() blocks the calling thread, which on
+        # the IHttpListener path is Burp's proxy thread (would freeze proxy
+        # under bursty traffic). offer() returns False if queue is full;
+        # we drop the entry and mark it as Error so user can retry via Start All.
+        if not self._work_queue.offer((entry, row)):
+            entry.status = STATUS_ERROR
+            entry.error_msg = "Queue full (>2000 pending) - retry via Start All"
+            try:
+                self.table_model.update_status(row)
+            except Exception:
+                pass
+            self._log_on_edt(
+                "[BACKPRESSURE] queue full, dropped %s (retry via Start All)"
+                % entry.path)
 
     def _get_pool(self):
         with self._pool_lock:
@@ -1228,24 +1320,15 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         SwingUtilities.invokeLater(Refresh())
 
     def _log_on_edt(self, msg):
-        log_area = self._log_area
-        extender = self
-
-        class Logger(Runnable):
-            def run(self_inner):
-                extender._log_line_count += 1
-                # Truncate log when it gets too large
-                if extender._log_line_count > MAX_LOG_LINES:
-                    text = log_area.getText()
-                    # Keep last half of lines
-                    lines = text.split("\n")
-                    if len(lines) > MAX_LOG_LINES // 2:
-                        trimmed = "\n".join(lines[-(MAX_LOG_LINES // 2):])
-                        log_area.setText(trimmed)
-                        extender._log_line_count = MAX_LOG_LINES // 2
-                log_area.append(msg + "\n")
-                log_area.setCaretPosition(log_area.getDocument().getLength())
-        SwingUtilities.invokeLater(Logger())
+        # Just enqueue to the log buffer - the AWT Timer (started in _build_ui)
+        # batches writes to the JTextArea every 200ms. This avoids EDT overload
+        # at scale (40k+ hosts x 19 mutations x ~5 logs/mutation = millions of msgs).
+        with self._log_buf_lock:
+            self._log_buf.append(msg)
+            # Hard cap on buffer size to prevent runaway memory if producers
+            # outpace the timer for an extended period.
+            if len(self._log_buf) > 5000:
+                self._log_buf.popleft()
 
     def log(self, msg):
         self._log_on_edt(msg)
