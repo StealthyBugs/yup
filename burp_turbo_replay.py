@@ -847,28 +847,39 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._autorun_cb = JCheckBox("Auto-run", False)
         row2.add(self._autorun_cb)
         top_wrapper.add(row2)
-        # --- CL mutations row ---
+        # --- CL mutations: split across multiple rows so checkboxes don't
+        # get clipped by the parent BoxLayout when there are many mutations.
         self._mut_checkboxes = {}
-        row_cl = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
-        row_cl.add(JLabel("CL mutations:"))
-        for mut in CL_MUTATIONS:
-            cb = JCheckBox(mut, True)
-            cb.setToolTipText(
-                "%s method + Content-Length + smuggle body" % MUTATION_METHODS.get(mut, "POST"))
-            row_cl.add(cb)
-            self._mut_checkboxes[mut] = cb
-        top_wrapper.add(row_cl)
-        # --- TE mutations row ---
-        row_te = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
-        row_te.add(JLabel("TE mutations:"))
-        for mut in TE_MUTATIONS:
-            cb = JCheckBox(mut, True)
-            cb.setToolTipText(
-                "%s method + Transfer-Encoding: chunked + chunked smuggle body"
-                % MUTATION_METHODS.get(mut, "POST"))
-            row_te.add(cb)
-            self._mut_checkboxes[mut] = cb
-        top_wrapper.add(row_te)
+        per_row = 7
+        cl_chunks = [CL_MUTATIONS[i:i + per_row]
+                     for i in range(0, len(CL_MUTATIONS), per_row)]
+        for idx, chunk in enumerate(cl_chunks):
+            row = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
+            label = "CL mutations:" if idx == 0 else " "
+            row.add(JLabel(label))
+            for mut in chunk:
+                cb = JCheckBox(mut, True)
+                cb.setToolTipText(
+                    "%s method + Content-Length + smuggle body"
+                    % MUTATION_METHODS.get(mut, "POST"))
+                row.add(cb)
+                self._mut_checkboxes[mut] = cb
+            top_wrapper.add(row)
+        # --- TE mutations: same multi-row treatment ---
+        te_chunks = [TE_MUTATIONS[i:i + per_row]
+                     for i in range(0, len(TE_MUTATIONS), per_row)]
+        for idx, chunk in enumerate(te_chunks):
+            row_te = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
+            label = "TE mutations:" if idx == 0 else " "
+            row_te.add(JLabel(label))
+            for mut in chunk:
+                cb = JCheckBox(mut, True)
+                cb.setToolTipText(
+                    "%s method + Transfer-Encoding: chunked + chunked smuggle body"
+                    % MUTATION_METHODS.get(mut, "POST"))
+                row_te.add(cb)
+                self._mut_checkboxes[mut] = cb
+            top_wrapper.add(row_te)
         self._main_panel.add(top_wrapper, BorderLayout.NORTH)
         self._table = JTable(self.table_model)
         self._table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
