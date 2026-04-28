@@ -656,6 +656,7 @@ class ReplayTask(object):
                         attack_results[code] = attack_results.get(code, 0) + 1
                         if (code != atk_bl_code
                                 and code != 429
+                                and code != -1
                                 and code not in attack_mismatch):
                             attack_mismatch[code] = SyntheticHttpRequestResponse(
                                 attack_modified, resp_bytes, entry.http_service)
@@ -692,6 +693,7 @@ class ReplayTask(object):
                         normal_results[code] = normal_results.get(code, 0) + 1
                         if (code != norm_bl_code
                                 and code != 429
+                                and code != -1
                                 and code not in normal_mismatch):
                             normal_mismatch[code] = SyntheticHttpRequestResponse(
                                 normal_modified, resp_bytes, entry.http_service)
