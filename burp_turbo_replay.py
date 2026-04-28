@@ -178,7 +178,8 @@ def _read_chunked_body(bis, resp_buf):
         _read_line_bytes(bis)
 
 
-def read_single_response(bis):
+def read_single_response(bis, request_method=None):
+    is_head = bool(request_method and request_method.upper() == "HEAD")
     while True:
         try:
             resp_buf = ByteArrayOutputStream()
@@ -200,6 +201,11 @@ def read_single_response(bis):
             code = int(status_parts[1])
             if 100 <= code <= 199:
                 continue
+            # HEAD responses, 204, and 304 MUST NOT have a body even if
+            # Content-Length / Transfer-Encoding headers say otherwise.
+            # Reading the body would block until the 10s socket timeout.
+            if is_head or code == 204 or code == 304:
+                return (code, resp_buf.toByteArray())
             content_length = -1
             is_chunked = False
             for i in range(1, len(header_lines)):
@@ -624,6 +630,12 @@ class ReplayTask(object):
         use_ssl = str(entry.http_service.getProtocol()).lower() == "https"
         attack_raw_bytes = bytearray(attack_modified)
         normal_raw_bytes = bytearray(normal_modified)
+        attack_method = MUTATION_METHODS.get(mutation, "POST")
+        try:
+            normal_method = self.extender._helpers.analyzeRequest(
+                entry.http_service, entry.raw_request).getMethod()
+        except Exception:
+            normal_method = "GET"
         results_lock = threading.Lock()
         latch = CountDownLatch(remaining * 2)
         pool = self.extender._get_pool()
@@ -637,7 +649,7 @@ class ReplayTask(object):
                     inp = BufferedInputStream(sock.getInputStream())
                     out.write(attack_raw_bytes)
                     out.flush()
-                    code, resp_bytes = read_single_response(inp)
+                    code, resp_bytes = read_single_response(inp, attack_method)
                     if resp_bytes is not None and len(resp_bytes) > 4096:
                         resp_bytes = resp_bytes[:4096]
                     with results_lock:
@@ -673,7 +685,7 @@ class ReplayTask(object):
                     inp = BufferedInputStream(sock.getInputStream())
                     out.write(normal_raw_bytes)
                     out.flush()
-                    code, resp_bytes = read_single_response(inp)
+                    code, resp_bytes = read_single_response(inp, normal_method)
                     if resp_bytes is not None and len(resp_bytes) > 4096:
                         resp_bytes = resp_bytes[:4096]
                     with results_lock:
@@ -1111,14 +1123,18 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
     def _on_start_all(self, event):
         self._read_connection_count()
         for i, e in enumerate(self.table_model.entries):
-            if e.status == STATUS_PENDING:
+            if e.status in (STATUS_PENDING, STATUS_ERROR):
+                e.status = STATUS_PENDING
+                e.error_msg = ""
                 self._launch_replay(e, i)
 
     def _on_start_selected(self, event):
         self._read_connection_count()
         for r in self._table.getSelectedRows():
             e = self.table_model.entries[r]
-            if e.status == STATUS_PENDING:
+            if e.status in (STATUS_PENDING, STATUS_ERROR):
+                e.status = STATUS_PENDING
+                e.error_msg = ""
                 self._launch_replay(e, r)
 
     def _on_clear(self, event):
