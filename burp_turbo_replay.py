@@ -473,25 +473,37 @@ class ReplayTask(object):
         all_results = {}
         for mutation in mutations:
             body_str = self.extender.get_exploit_body(mutation)
-            m_results, m_mismatch, m_flagged, m_baseline_code, m_baseline_len, m_baseline_rr = (
+            (combined_results, attack_results, normal_results,
+             attack_mismatch, normal_mismatch, flagged_responses,
+             atk_bl_code, atk_bl_len, atk_bl_rr,
+             norm_bl_code, norm_bl_len, norm_bl_rr) = (
                 self._run_mutation(entry, mutation, body_str, flag_code))
-            for code, cnt in m_results.items():
-                key = "%s:%s" % (mutation, code)
+            for combined_key, cnt in combined_results.items():
+                key = "%s %s" % (mutation, combined_key)
                 all_results[key] = cnt
-            if m_mismatch:
+            if attack_mismatch:
                 try:
                     self._raise_mismatch_issue(
-                        entry, mutation, m_results, m_mismatch,
-                        m_baseline_code, m_baseline_len, m_baseline_rr)
+                        entry, mutation, attack_results, attack_mismatch,
+                        atk_bl_code, atk_bl_len, atk_bl_rr)
                 except Exception as ex:
                     self.extender._log_on_edt(
                         "** MISMATCH ISSUE ERROR ** %s [%s]: %s"
                         % (entry.path, mutation, str(ex)))
-            if m_flagged:
+            if normal_mismatch:
+                try:
+                    self._raise_normal_mismatch_issue(
+                        entry, mutation, normal_results, normal_mismatch,
+                        norm_bl_code, norm_bl_len, norm_bl_rr)
+                except Exception as ex:
+                    self.extender._log_on_edt(
+                        "** NORMAL MISMATCH ISSUE ERROR ** %s [%s]: %s"
+                        % (entry.path, mutation, str(ex)))
+            if flagged_responses:
                 try:
                     self._raise_scan_issue(
-                        entry, mutation, flag_code, m_flagged,
-                        m_results, m_baseline_code)
+                        entry, mutation, flag_code, flagged_responses,
+                        attack_results, atk_bl_code)
                 except Exception as ex:
                     self.extender._log_on_edt(
                         "** FLAG ISSUE ERROR ** %s [%s]: %s"
@@ -502,76 +514,134 @@ class ReplayTask(object):
         self._log_result()
         self._release_entry(entry)
 
+    def _build_normal_request(self, entry):
+        """Build a normal (un-mutated) request with Connection: close so
+        the raw socket reads cleanly to EOF. Mirrors the manual byte
+        assembly used by build_smuggle_request to avoid Burp helpers
+        injecting unwanted headers."""
+        helpers = self.extender._helpers
+        analyzed = helpers.analyzeRequest(entry.http_service, entry.raw_request)
+        headers = list(analyzed.getHeaders())
+        body_offset = analyzed.getBodyOffset()
+        body_bytes_orig = entry.raw_request[body_offset:]
+        new_headers = [headers[0]]
+        for h in headers[1:]:
+            if h.lower().startswith("connection:"):
+                continue
+            new_headers.append(h)
+        new_headers.append("Connection: close")
+        header_str = "\r\n".join(new_headers) + "\r\n\r\n"
+        header_bytes = helpers.stringToBytes(header_str)
+        body_len = len(body_bytes_orig) if body_bytes_orig is not None else 0
+        result = jarray.zeros(len(header_bytes) + body_len, 'b')
+        JSystem.arraycopy(header_bytes, 0, result, 0, len(header_bytes))
+        if body_len > 0:
+            JSystem.arraycopy(body_bytes_orig, 0, result, len(header_bytes), body_len)
+        return result
+
     def _run_mutation(self, entry, mutation, body_str, flag_code):
         helpers = self.extender._helpers
         callbacks = self.extender._callbacks
         try:
-            modified = build_smuggle_request(
+            attack_modified = build_smuggle_request(
                 helpers, entry.raw_request, entry.http_service, body_str,
                 mutation)
         except Exception as ex:
             self.extender._log_on_edt(
                 "[ERROR] %s %s build failed: %s" % (mutation, entry.path, str(ex)))
-            return ({-1: 1}, {}, [], -1, 0, None)
-        # Baseline via Burp API
+            empty = {-1: 1}
+            combined_empty = {"atk:-1": 1}
+            return (combined_empty, empty, {}, {}, {}, [], -1, 0, None, -1, 0, None)
         try:
-            bl_rr = callbacks.makeHttpRequest(entry.http_service, modified)
-            bl_bytes = bl_rr.getResponse()
-            bl_code, bl_len = parse_final_status(bl_bytes, helpers)
+            normal_modified = self._build_normal_request(entry)
+        except Exception as ex:
+            self.extender._log_on_edt(
+                "[ERROR] %s %s normal build failed: %s"
+                % (mutation, entry.path, str(ex)))
+            empty = {-1: 1}
+            combined_empty = {"atk:-1": 1, "norm:-1": 1}
+            return (combined_empty, empty, empty, {}, {}, [], -1, 0, None, -1, 0, None)
+        # Attack baseline via Burp API
+        try:
+            atk_bl_rr = callbacks.makeHttpRequest(entry.http_service, attack_modified)
+            atk_bl_bytes = atk_bl_rr.getResponse()
+            atk_bl_code, atk_bl_len = parse_final_status(atk_bl_bytes, helpers)
         except Exception:
-            bl_code = -1
-            bl_len = 0
-            bl_rr = None
-        # Store baseline on entry (last mutation wins for display)
-        entry.baseline_code = bl_code
-        entry.baseline_length = bl_len
-        entry.baseline_response = bl_rr
+            atk_bl_code = -1
+            atk_bl_len = 0
+            atk_bl_rr = None
+        # Normal baseline via Burp API
+        try:
+            norm_bl_rr = callbacks.makeHttpRequest(entry.http_service, normal_modified)
+            norm_bl_bytes = norm_bl_rr.getResponse()
+            norm_bl_code, norm_bl_len = parse_final_status(norm_bl_bytes, helpers)
+        except Exception:
+            norm_bl_code = -1
+            norm_bl_len = 0
+            norm_bl_rr = None
+        # Store ATTACK baseline on entry (preserves UI behavior)
+        entry.baseline_code = atk_bl_code
+        entry.baseline_length = atk_bl_len
+        entry.baseline_response = atk_bl_rr
         self._update_ui()
         self.extender._log_on_edt(
-            "[BASELINE %s] %s  |  Status: %s  |  Body: %d bytes"
-            % (mutation, entry.path, bl_code, bl_len))
+            "[BASELINE atk %s] %s  |  Status: %s  |  Body: %d bytes"
+            % (mutation, entry.path, atk_bl_code, atk_bl_len))
+        self.extender._log_on_edt(
+            "[BASELINE norm %s] %s  |  Status: %s  |  Body: %d bytes"
+            % (mutation, entry.path, norm_bl_code, norm_bl_len))
         remaining = entry.replay_count - 1
-        results = {bl_code: 1}
-        mismatch_samples = {}
+        attack_results = {atk_bl_code: 1}
+        normal_results = {norm_bl_code: 1}
+        attack_mismatch = {}
+        normal_mismatch = {}
         flagged_responses = []
         if remaining < 1:
-            return (results, mismatch_samples, flagged_responses, bl_code, bl_len, bl_rr)
+            combined = {
+                "atk:%s" % atk_bl_code: 1,
+                "norm:%s" % norm_bl_code: 1,
+            }
+            return (combined, attack_results, normal_results,
+                    attack_mismatch, normal_mismatch, flagged_responses,
+                    atk_bl_code, atk_bl_len, atk_bl_rr,
+                    norm_bl_code, norm_bl_len, norm_bl_rr)
         host = str(entry.http_service.getHost())
         port = entry.http_service.getPort()
         use_ssl = str(entry.http_service.getProtocol()).lower() == "https"
-        baseline_code = bl_code
-        raw_bytes = bytearray(modified)
+        attack_raw_bytes = bytearray(attack_modified)
+        normal_raw_bytes = bytearray(normal_modified)
         results_lock = threading.Lock()
-        latch = CountDownLatch(remaining)
+        latch = CountDownLatch(remaining * 2)
         pool = self.extender._get_pool()
 
-        class RawSender(Runnable):
+        class AttackSender(Runnable):
             def run(self_inner):
                 sock = None
                 try:
                     sock = create_raw_socket(host, port, use_ssl)
                     out = BufferedOutputStream(sock.getOutputStream())
                     inp = BufferedInputStream(sock.getInputStream())
-                    out.write(raw_bytes)
+                    out.write(attack_raw_bytes)
                     out.flush()
                     code, resp_bytes = read_single_response(inp)
-                    # Cap stored response to 4KB to avoid memory bloat
                     if resp_bytes is not None and len(resp_bytes) > 4096:
                         resp_bytes = resp_bytes[:4096]
                     with results_lock:
-                        results[code] = results.get(code, 0) + 1
-                        if code != baseline_code and code not in mismatch_samples:
-                            mismatch_samples[code] = SyntheticHttpRequestResponse(
-                                modified, resp_bytes, entry.http_service)
+                        attack_results[code] = attack_results.get(code, 0) + 1
+                        if (code != atk_bl_code
+                                and code != 429
+                                and code not in attack_mismatch):
+                            attack_mismatch[code] = SyntheticHttpRequestResponse(
+                                attack_modified, resp_bytes, entry.http_service)
                         if (flag_code is not None
                                 and code == flag_code
-                                and code != baseline_code
+                                and code != atk_bl_code
                                 and len(flagged_responses) < 3):
                             flagged_responses.append(SyntheticHttpRequestResponse(
-                                modified, resp_bytes, entry.http_service))
+                                attack_modified, resp_bytes, entry.http_service))
                 except Exception:
                     with results_lock:
-                        results[-1] = results.get(-1, 0) + 1
+                        attack_results[-1] = attack_results.get(-1, 0) + 1
                 finally:
                     if sock is not None:
                         try:
@@ -580,22 +650,67 @@ class ReplayTask(object):
                             pass
                     latch.countDown()
 
-        for _ in range(remaining):
-            pool.submit(RawSender())
-        # Timeout: 30s per request worst case, but cap at 120s total
-        timeout_secs = min(remaining * 30, 120)
+        class NormalSender(Runnable):
+            def run(self_inner):
+                sock = None
+                try:
+                    sock = create_raw_socket(host, port, use_ssl)
+                    out = BufferedOutputStream(sock.getOutputStream())
+                    inp = BufferedInputStream(sock.getInputStream())
+                    out.write(normal_raw_bytes)
+                    out.flush()
+                    code, resp_bytes = read_single_response(inp)
+                    if resp_bytes is not None and len(resp_bytes) > 4096:
+                        resp_bytes = resp_bytes[:4096]
+                    with results_lock:
+                        normal_results[code] = normal_results.get(code, 0) + 1
+                        if (code != norm_bl_code
+                                and code != 429
+                                and code not in normal_mismatch):
+                            normal_mismatch[code] = SyntheticHttpRequestResponse(
+                                normal_modified, resp_bytes, entry.http_service)
+                except Exception:
+                    with results_lock:
+                        normal_results[-1] = normal_results.get(-1, 0) + 1
+                finally:
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+                    latch.countDown()
+
+        for i in range(remaining):
+            pool.submit(AttackSender())
+            pool.submit(NormalSender())
+        # Timeout: 60s per request pair worst case, capped at 240s total
+        timeout_secs = min(remaining * 60, 240)
         finished = latch.await(timeout_secs, TimeUnit.SECONDS)
         if not finished:
             self.extender._log_on_edt(
                 "[TIMEOUT %s] %s  |  latch timed out after %ds, continuing"
                 % (mutation, entry.path, timeout_secs))
+        # Build combined results dict for entry display
+        combined = {}
+        for code, cnt in attack_results.items():
+            combined["atk:%s" % code] = cnt
+        for code, cnt in normal_results.items():
+            combined["norm:%s" % code] = cnt
         # Log per-mutation summary
-        parts = []
-        for code, cnt in sorted(results.items()):
-            parts.append("%s: %d" % (code if code > 0 else "Err", cnt))
+        atk_parts = []
+        for code, cnt in sorted(attack_results.items()):
+            atk_parts.append("%s: %d" % (code if code > 0 else "Err", cnt))
+        norm_parts = []
+        for code, cnt in sorted(normal_results.items()):
+            norm_parts.append("%s: %d" % (code if code > 0 else "Err", cnt))
         self.extender._log_on_edt(
-            "[%s] %s  |  %s" % (mutation, entry.path, ", ".join(parts)))
-        return (results, mismatch_samples, flagged_responses, bl_code, bl_len, bl_rr)
+            "[%s] %s | atk: %s | norm: %s"
+            % (mutation, entry.path,
+               ", ".join(atk_parts), ", ".join(norm_parts)))
+        return (combined, attack_results, normal_results,
+                attack_mismatch, normal_mismatch, flagged_responses,
+                atk_bl_code, atk_bl_len, atk_bl_rr,
+                norm_bl_code, norm_bl_len, norm_bl_rr)
 
     def _release_entry(self, entry):
         """Drop heavy references after processing so GC can reclaim memory."""
@@ -648,17 +763,20 @@ class ReplayTask(object):
             "%s: %d" % (k, n) for k, n in sorted(m_results.items()))
         mm_codes = ", ".join(str(c) for c in sorted(mismatch_samples.keys()))
         detail = (
-            "<b>Turbo Replay - Baseline Mismatch [%s]</b><br><br>"
+            "<b>Turbo Replay - Attack Stream Mismatch [%s]</b><br><br>"
             "Endpoint: <b>%s</b><br>"
             "Mutation: <b>%s</b><br>"
-            "Baseline: <b>%s</b> (%s bytes body)<br>"
-            "Total: <b>%d</b> | Matched: <b>%d</b> | "
+            "Attack-stream baseline: <b>%s</b> (%s bytes body)<br>"
+            "Total attack replays: <b>%d</b> | Matched: <b>%d</b> | "
             "Mismatched: <b>%d</b><br>"
             "Mismatch codes: <b>%s</b><br>"
             "Breakdown: %s<br><br>"
-            "Inconsistent responses may indicate desync."
+            "The %s attack mutation drifted from its own baseline across "
+            "replays. Inconsistent responses on the attack stream may "
+            "indicate desync or unstable parsing of the malformed request."
             % (mutation, entry.path, mutation, m_baseline_code,
-               m_baseline_len, total, bl_hits, mm_total, mm_codes, breakdown))
+               m_baseline_len, total, bl_hits, mm_total, mm_codes,
+               breakdown, mutation))
         messages = []
         if m_baseline_rr is not None:
             messages.append(m_baseline_rr)
@@ -667,12 +785,55 @@ class ReplayTask(object):
         issue = TurboReplayIssue(
             http_service=entry.http_service, url=url,
             http_messages=messages,
-            name="Turbo Replay [%s]: Baseline Mismatch on %s"
+            name="Turbo Replay [%s]: Attack Stream Drift on %s"
                  % (mutation, entry.path),
             detail=detail, severity="Medium")
         callbacks.addScanIssue(issue)
         self.extender._log_on_edt(
-            "** MEDIUM ISSUE ** [%s] %s | %d/%d mismatched (baseline %s, codes: %s)"
+            "** MEDIUM ISSUE (attack drift) ** [%s] %s | %d/%d mismatched (baseline %s, codes: %s)"
+            % (mutation, entry.path, mm_total, total, m_baseline_code, mm_codes))
+
+    def _raise_normal_mismatch_issue(self, entry, mutation, m_results,
+                                     mismatch_samples, m_baseline_code,
+                                     m_baseline_len, m_baseline_rr):
+        callbacks = self.extender._callbacks
+        protocol = str(entry.http_service.getProtocol())
+        host = str(entry.http_service.getHost())
+        port = entry.http_service.getPort()
+        url = URL(protocol, host, port, entry.path)
+        total = sum(m_results.values())
+        bl_hits = m_results.get(m_baseline_code, 0)
+        mm_total = total - bl_hits
+        breakdown = ", ".join(
+            "%s: %d" % (k, n) for k, n in sorted(m_results.items()))
+        mm_codes = ", ".join(str(c) for c in sorted(mismatch_samples.keys()))
+        detail = (
+            "<b>Turbo Replay - Normal Request State Change [%s]</b><br><br>"
+            "Endpoint: <b>%s</b><br>"
+            "Mutation running alongside: <b>%s</b><br>"
+            "Normal-stream baseline: <b>%s</b> (%s bytes)<br>"
+            "Total normal replays: <b>%d</b> | Matched: <b>%d</b> | Mismatched: <b>%d</b><br>"
+            "Mismatch codes: <b>%s</b><br>"
+            "Breakdown: %s<br><br>"
+            "Un-mutated requests sent in parallel with the %s attack mutation produced inconsistent responses, "
+            "strongly indicating server-side state was perturbed by the attack stream (likely desync)."
+            % (mutation, entry.path, mutation, m_baseline_code,
+               m_baseline_len, total, bl_hits, mm_total, mm_codes,
+               breakdown, mutation))
+        messages = []
+        if m_baseline_rr is not None:
+            messages.append(m_baseline_rr)
+        for c in sorted(mismatch_samples.keys()):
+            messages.append(mismatch_samples[c])
+        issue = TurboReplayIssue(
+            http_service=entry.http_service, url=url,
+            http_messages=messages,
+            name="Turbo Replay [%s]: Normal Request Drift on %s"
+                 % (mutation, entry.path),
+            detail=detail, severity="High")
+        callbacks.addScanIssue(issue)
+        self.extender._log_on_edt(
+            "** HIGH ISSUE (normal drift) ** [%s] %s | %d/%d mismatched (baseline %s, codes: %s)"
             % (mutation, entry.path, mm_total, total, m_baseline_code, mm_codes))
 
     def _update_ui(self):
