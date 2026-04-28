@@ -590,6 +590,20 @@ class ReplayTask(object):
         self.extender._log_on_edt(
             "[BASELINE norm %s] %s  |  Status: %s  |  Body: %d bytes"
             % (mutation, entry.path, norm_bl_code, norm_bl_len))
+        # Skip this mutation entirely if either baseline is rate-limited.
+        # Replay results would be meaningless noise.
+        if atk_bl_code == 429 or norm_bl_code == 429:
+            self.extender._log_on_edt(
+                "[SKIP %s] %s  |  baseline 429 (rate-limited), skipping mutation"
+                % (mutation, entry.path))
+            combined_skip = {
+                "atk:%s" % atk_bl_code: 1,
+                "norm:%s" % norm_bl_code: 1,
+            }
+            return (combined_skip, {atk_bl_code: 1}, {norm_bl_code: 1},
+                    {}, {}, [],
+                    atk_bl_code, atk_bl_len, atk_bl_rr,
+                    norm_bl_code, norm_bl_len, norm_bl_rr)
         remaining = entry.replay_count - 1
         attack_results = {atk_bl_code: 1}
         normal_results = {norm_bl_code: 1}
