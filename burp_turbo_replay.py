@@ -15,6 +15,7 @@ from java.util.concurrent import CountDownLatch, LinkedBlockingQueue, Executors,
 from javax.net.ssl import SSLContext, X509TrustManager
 import jarray
 import threading
+import time
 from urlparse import urlparse
 
 STATUS_PENDING = "Pending"
@@ -922,6 +923,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         # Issue deduplication: (host, mutation, severity) -> already raised
         self._raised_issues = set()
         self._raised_issues_lock = threading.Lock()
+        # Backpressure log throttling: collapse repeated drops into periodic
+        # summary lines so real findings stay visible.
+        self._dropped_count = 0
+        self._dropped_last_log = 0
+        self._dropped_lock = threading.Lock()
         # Log throttling: producer threads append to _log_buf under _log_buf_lock
         # an AWT Timer flushes the buffer to the JTextArea every 200ms in batches.
         # This collapses ~3.8M EDT calls at scale into ~5/second.
@@ -1220,6 +1226,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             self._raised_issues.clear()
         with self._log_buf_lock:
             self._log_buf.clear()
+        with self._dropped_lock:
+            self._dropped_count = 0
+            self._dropped_last_log = 0
         self.table_model.clear()
         self._log_area.setText("")
         self._log_line_count = 0
@@ -1250,9 +1259,25 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 self.table_model.update_status(row)
             except Exception:
                 pass
-            self._log_on_edt(
-                "[BACKPRESSURE] queue full, dropped %s (retry via Start All)"
-                % entry.path)
+            # Throttle backpressure log: emit a summary at most every 30s
+            # OR every 500 drops, whichever comes first. Avoids drowning the
+            # log when proxy traffic vastly exceeds the master loop's pace.
+            should_log = False
+            count_to_report = 0
+            now = time.time()
+            with self._dropped_lock:
+                self._dropped_count += 1
+                if (self._dropped_count - self._dropped_last_log >= 500
+                        or now - getattr(self, "_dropped_last_time", 0) >= 30):
+                    count_to_report = self._dropped_count - self._dropped_last_log
+                    self._dropped_last_log = self._dropped_count
+                    self._dropped_last_time = now
+                    should_log = True
+            if should_log:
+                self._log_on_edt(
+                    "[BACKPRESSURE] queue full, dropped %d endpoint(s) "
+                    "in last interval (total dropped: %d, retry via Start All)"
+                    % (count_to_report, self._dropped_count))
 
     def _get_pool(self):
         with self._pool_lock:
