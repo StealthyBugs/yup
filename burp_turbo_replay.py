@@ -953,6 +953,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._build_ui()
         callbacks.registerHttpListener(self)
         callbacks.addSuiteTab(self)
+        # Background auto-refill: when the work queue drains, automatically
+        # re-enqueue any entries that were previously dropped due to
+        # backpressure. User doesn't have to babysit Start All for big lists.
+        refill = threading.Thread(target=self._autorefill_loop)
+        refill.daemon = True
+        refill.start()
 
     def getTabCaption(self):
         return "Turbo Replay"
@@ -1338,15 +1344,67 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 except Exception:
                     pass
 
+    def _autorefill_loop(self):
+        """Daemon: every 5s, if the work queue has drained below the high
+        watermark, re-enqueue entries that were previously dropped due to
+        backpressure. Lets the user fire-and-forget a 40k-host list."""
+        while True:
+            try:
+                time.sleep(5)
+                free = 2000 - self._work_queue.size()
+                if free < 200:
+                    continue  # still mostly full, wait
+                # Find STATUS_ERROR entries flagged with the backpressure
+                # error message - those are candidates for retry.
+                with self.table_model._lock:
+                    candidates = [(i, e) for i, e in enumerate(self.table_model.entries)
+                                  if e.status == STATUS_ERROR
+                                  and e.error_msg
+                                  and "Queue full" in e.error_msg]
+                if not candidates:
+                    continue
+                refilled = 0
+                for i, e in candidates[:free]:
+                    e.status = STATUS_PENDING
+                    e.error_msg = ""
+                    if not self._work_queue.offer((e, i)):
+                        # Queue filled up mid-refill, stop and try again next cycle
+                        e.status = STATUS_ERROR
+                        e.error_msg = "Queue full (>2000 pending) - retry via Start All"
+                        break
+                    refilled += 1
+                if refilled > 0:
+                    self._log_on_edt(
+                        "[AUTO-REFILL] re-enqueued %d previously-dropped endpoint(s)"
+                        % refilled)
+                    try:
+                        self.table_model.fireTableDataChanged()
+                    except Exception:
+                        pass
+            except Exception:
+                try:
+                    self._callbacks.printError(
+                        "Turbo Replay autorefill error - continuing")
+                except Exception:
+                    pass
+
     def _trim_completed_entries(self):
         """Remove old completed/error entries from the table to prevent
-        unbounded memory growth over tens of thousands of targets."""
+        unbounded memory growth over tens of thousands of targets.
+        Skips backpressure-dropped entries so they remain available for
+        the auto-refill thread to re-enqueue."""
         model = self.table_model
         keep_last = 100
+
+        def is_finished(e):
+            if e.status == STATUS_COMPLETED:
+                return True
+            if e.status == STATUS_ERROR and e.error_msg and "Queue full" in e.error_msg:
+                return False  # awaiting auto-refill, don't trim
+            return e.status == STATUS_ERROR
+
         with model._lock:
-            # Count completed entries
-            completed = [i for i, e in enumerate(model.entries)
-                         if e.status in (STATUS_COMPLETED, STATUS_ERROR)]
+            completed = [i for i, e in enumerate(model.entries) if is_finished(e)]
             if len(completed) <= keep_last:
                 return
             remove_count = len(completed) - keep_last
