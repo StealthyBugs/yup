@@ -23,7 +23,7 @@ STATUS_RUNNING = "Running"
 STATUS_COMPLETED = "Completed"
 STATUS_ERROR = "Error"
 DEFAULT_REPLAY_COUNT = 100
-DEFAULT_CONNECTIONS = 100
+DEFAULT_CONNECTIONS = 200
 MAX_LOG_LINES = 2000
 MUTATION_EXPECT = "CL Expect"
 MUTATION_EXPECT_10 = "EXPECT-1.0"
@@ -713,8 +713,17 @@ class ReplayTask(object):
         for i in range(remaining):
             pool.submit(AttackSender())
             pool.submit(NormalSender())
-        # Timeout: 60s per request pair worst case, capped at 240s total
-        timeout_secs = min(remaining * 60, 240)
+        # Timeout: when "Aggressive timeout" is checked (default), cap
+        # at 60s to skip slow/dead hosts fast. Otherwise scale with
+        # remaining and cap at 240s.
+        try:
+            aggressive = self.extender._aggressive_timeout_cb.isSelected()
+        except Exception:
+            aggressive = True
+        if aggressive:
+            timeout_secs = 60
+        else:
+            timeout_secs = min(remaining * 60, 240)
         finished = latch.await(timeout_secs, TimeUnit.SECONDS)
         if not finished:
             self.extender._log_on_edt(
@@ -1070,6 +1079,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         row2.add(Box.createHorizontalStrut(12))
         self._autorun_cb = JCheckBox("Auto-run", False)
         row2.add(self._autorun_cb)
+        row2.add(Box.createHorizontalStrut(12))
+        self._aggressive_timeout_cb = JCheckBox("Aggressive timeout (60s)", True)
+        self._aggressive_timeout_cb.setToolTipText(
+            "When checked, each mutation's replay batch is capped at 60s "
+            "instead of up to 240s. Skips slow/dead hosts faster - "
+            "boosts throughput at the cost of a few timeouts.")
+        row2.add(self._aggressive_timeout_cb)
         top_wrapper.add(row2)
         # --- CL mutations: split across multiple rows so checkboxes don't
         # get clipped by the parent BoxLayout when there are many mutations.
@@ -1097,7 +1113,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             label = "TE mutations:" if idx == 0 else " "
             row_te.add(JLabel(label))
             for mut in chunk:
-                cb = JCheckBox(mut, True)
+                cb = JCheckBox(mut, False)
                 cb.setToolTipText(
                     "%s method + Transfer-Encoding: chunked + chunked smuggle body"
                     % MUTATION_METHODS.get(mut, "POST"))
