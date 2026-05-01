@@ -598,12 +598,13 @@ class ReplayTask(object):
         self.extender._log_on_edt(
             "[BASELINE norm %s] %s  |  Status: %s  |  Body: %d bytes"
             % (mutation, entry.path, norm_bl_code, norm_bl_len))
-        # Skip this mutation entirely if either baseline is rate-limited.
+        # Skip this mutation entirely if either baseline is a denied code.
         # Replay results would be meaningless noise.
-        if atk_bl_code == 429 or norm_bl_code == 429:
+        deny_codes = self.extender.get_deny_codes()
+        if atk_bl_code in deny_codes or norm_bl_code in deny_codes:
             self.extender._log_on_edt(
-                "[SKIP %s] %s  |  baseline 429 (rate-limited), skipping mutation"
-                % (mutation, entry.path))
+                "[SKIP %s] %s  |  baseline %s/%s is a deny code, skipping mutation"
+                % (mutation, entry.path, atk_bl_code, norm_bl_code))
             combined_skip = {
                 "atk:%s" % atk_bl_code: 1,
                 "norm:%s" % norm_bl_code: 1,
@@ -657,8 +658,7 @@ class ReplayTask(object):
                     with results_lock:
                         attack_results[code] = attack_results.get(code, 0) + 1
                         if (code != atk_bl_code
-                                and code != 429
-                                and code != -1
+                                and code not in deny_codes
                                 and code not in attack_mismatch):
                             attack_mismatch[code] = SyntheticHttpRequestResponse(
                                 attack_modified, resp_bytes, entry.http_service)
@@ -694,8 +694,7 @@ class ReplayTask(object):
                     with results_lock:
                         normal_results[code] = normal_results.get(code, 0) + 1
                         if (code != norm_bl_code
-                                and code != 429
-                                and code != -1
+                                and code not in deny_codes
                                 and code not in normal_mismatch):
                             normal_mismatch[code] = SyntheticHttpRequestResponse(
                                 normal_modified, resp_bytes, entry.http_service)
@@ -781,16 +780,17 @@ class ReplayTask(object):
             if sig in self.extender._raised_issues:
                 return
             self.extender._raised_issues.add(sig)
+        sev = "High" if flag_code == 400 else "Medium"
         issue = TurboReplayIssue(
             http_service=entry.http_service, url=url,
             http_messages=flagged_responses,
             name="Turbo Replay [%s]: Anomalous %d on %s"
                  % (mutation, flag_code, entry.path),
-            detail=detail, severity="High")
+            detail=detail, severity=sev)
         callbacks.addScanIssue(issue)
         self.extender._log_on_edt(
-            "** HIGH ISSUE ** [%s] %s | code %d x%d (baseline %s)"
-            % (mutation, entry.path, flag_code, count, m_baseline_code))
+            "** %s ISSUE ** [%s] %s | code %d x%d (baseline %s)"
+            % (sev.upper(), mutation, entry.path, flag_code, count, m_baseline_code))
 
     def _raise_mismatch_issue(self, entry, mutation, m_results,
                               mismatch_samples, m_baseline_code,
@@ -831,16 +831,17 @@ class ReplayTask(object):
             if sig in self.extender._raised_issues:
                 return
             self.extender._raised_issues.add(sig)
+        sev = "High" if 400 in mismatch_samples else "Medium"
         issue = TurboReplayIssue(
             http_service=entry.http_service, url=url,
             http_messages=messages,
             name="Turbo Replay [%s]: Attack Stream Drift on %s"
                  % (mutation, entry.path),
-            detail=detail, severity="Medium")
+            detail=detail, severity=sev)
         callbacks.addScanIssue(issue)
         self.extender._log_on_edt(
-            "** MEDIUM ISSUE (attack drift) ** [%s] %s | %d/%d mismatched (baseline %s, codes: %s)"
-            % (mutation, entry.path, mm_total, total, m_baseline_code, mm_codes))
+            "** %s ISSUE (attack drift) ** [%s] %s | %d/%d mismatched (baseline %s, codes: %s)"
+            % (sev.upper(), mutation, entry.path, mm_total, total, m_baseline_code, mm_codes))
 
     def _raise_normal_mismatch_issue(self, entry, mutation, m_results,
                                      mismatch_samples, m_baseline_code,
@@ -879,16 +880,17 @@ class ReplayTask(object):
             if sig in self.extender._raised_issues:
                 return
             self.extender._raised_issues.add(sig)
+        sev = "High" if 400 in mismatch_samples else "Medium"
         issue = TurboReplayIssue(
             http_service=entry.http_service, url=url,
             http_messages=messages,
             name="Turbo Replay [%s]: Normal Request Drift on %s"
                  % (mutation, entry.path),
-            detail=detail, severity="High")
+            detail=detail, severity=sev)
         callbacks.addScanIssue(issue)
         self.extender._log_on_edt(
-            "** HIGH ISSUE (normal drift) ** [%s] %s | %d/%d mismatched (baseline %s, codes: %s)"
-            % (mutation, entry.path, mm_total, total, m_baseline_code, mm_codes))
+            "** %s ISSUE (normal drift) ** [%s] %s | %d/%d mismatched (baseline %s, codes: %s)"
+            % (sev.upper(), mutation, entry.path, mm_total, total, m_baseline_code, mm_codes))
 
     def _update_ui(self):
         model = self.extender.table_model
@@ -993,6 +995,19 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         except (ValueError, TypeError):
             return None
 
+    def get_deny_codes(self):
+        codes = set([-1])
+        text = self._deny_code_field.getText().strip()
+        if not text:
+            return codes
+        for token in text.split(","):
+            token = token.strip()
+            try:
+                codes.add(int(token))
+            except (ValueError, TypeError):
+                pass
+        return codes
+
     def get_active_mutations(self):
         mutations = []
         for mut in ALL_MUTATIONS:
@@ -1070,6 +1085,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._flag_code_field = JTextField("", 5)
         self._flag_code_field.setToolTipText("Status code to flag as High severity (e.g. 400)")
         row1.add(self._flag_code_field)
+        row1.add(JLabel("  Deny Code:"))
+        self._deny_code_field = JTextField("429,502,503", 10)
+        self._deny_code_field.setToolTipText(
+            "Comma-separated status codes to ignore in mismatch detection "
+            "(e.g. 429,502,503). Socket errors (-1) are always denied.")
+        row1.add(self._deny_code_field)
         row1.add(Box.createHorizontalStrut(10))
         row1.add(JButton("Start All", actionPerformed=self._on_start_all))
         row1.add(JButton("Start Selected", actionPerformed=self._on_start_selected))
@@ -1232,6 +1253,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         t.start()
 
     def _bulk_enqueue(self, snap):
+        self._ensure_master_running()
+        enqueued = 0
         for i, e in snap:
             if e.status in (STATUS_PENDING, STATUS_ERROR):
                 e.status = STATUS_PENDING
@@ -1240,6 +1263,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 # Safe here because we're in a daemon thread, NOT the EDT
                 # or Burp's IHttpListener thread.
                 self._work_queue.put((e, i))
+                enqueued += 1
+                if enqueued % 100 == 0:
+                    self._ensure_master_running()
 
     def _on_clear(self, event):
         with self._seen_lock:
@@ -1322,7 +1348,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         while True:
             try:
                 entry, row = self._work_queue.take()
-                self._read_connection_count()
                 try:
                     ReplayTask(self, entry, row).run()
                 except Exception as ex:
@@ -1338,7 +1363,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 self._completed_count += 1
                 if self._completed_count % 100 == 0:
                     self._trim_completed_entries()
-            except Exception as ex:
+            except BaseException as ex:
                 try:
                     self._callbacks.printError("Turbo Replay error: %s" % str(ex))
                 except Exception:
@@ -1363,6 +1388,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                                   and "Queue full" in e.error_msg]
                 if not candidates:
                     continue
+                self._ensure_master_running()
                 refilled = 0
                 for i, e in candidates[:free]:
                     e.status = STATUS_PENDING
