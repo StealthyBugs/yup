@@ -9,7 +9,7 @@ from java.awt.event import ActionListener
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 from java.awt import BorderLayout, FlowLayout, Font, Color, Dimension
 from java.lang import Runnable, String, Integer, Thread as JThread, System as JSystem
-from java.net import Socket, URL
+from java.net import Socket, URL, InetSocketAddress
 from java.io import BufferedInputStream, BufferedOutputStream, ByteArrayOutputStream
 from java.util.concurrent import CountDownLatch, LinkedBlockingQueue, Executors, TimeUnit
 from javax.net.ssl import SSLContext, X509TrustManager
@@ -231,11 +231,15 @@ def read_single_response(bis, request_method=None):
 
 def create_raw_socket(host, port, use_ssl):
     if use_ssl:
+        # SSL: connect plain socket with timeout first, then wrap in TLS
+        raw = Socket()
+        raw.connect(InetSocketAddress(host, port), 10000)
         ctx = _get_ssl_context()
-        sock = ctx.getSocketFactory().createSocket(host, port)
+        sock = ctx.getSocketFactory().createSocket(raw, host, port, True)
         sock.startHandshake()
     else:
-        sock = Socket(host, port)
+        sock = Socket()
+        sock.connect(InetSocketAddress(host, port), 10000)
     sock.setTcpNoDelay(True)
     sock.setSoTimeout(10000)
     return sock
@@ -284,6 +288,7 @@ class EndpointEntry(object):
         self.baseline_code = None
         self.baseline_length = None
         self.baseline_response = None
+        self.retry_count = 0
 
 
 class TurboReplayIssue(IScanIssue):
@@ -750,10 +755,27 @@ class ReplayTask(object):
                 atk_bl_code, atk_bl_len, atk_bl_rr,
                 norm_bl_code, norm_bl_len, norm_bl_rr)
 
+    def _can_raise_issue(self):
+        """Check and increment the global issue counter. Returns False
+        if we've hit the cap (prevents Burp's issue store from consuming
+        unbounded memory over multi-day runs)."""
+        with self.extender._raised_issues_lock:
+            if self.extender._issue_count >= self.extender._max_issues:
+                return False
+            self.extender._issue_count += 1
+            # Cap the dedup set itself to prevent unbounded growth (~50k
+            # entries = ~5MB). After clearing, some duplicate issues may
+            # fire, but the issue_count cap limits total Burp-side impact.
+            if len(self.extender._raised_issues) > 50000:
+                self.extender._raised_issues.clear()
+            return True
+
     def _release_entry(self, entry):
         """Drop heavy references after processing so GC can reclaim memory."""
         entry.raw_request = None
         entry.baseline_response = None
+        entry.http_service = None
+        entry.results = None
 
     def _raise_scan_issue(self, entry, mutation, flag_code, flagged_responses,
                           m_results, m_baseline_code):
@@ -780,6 +802,8 @@ class ReplayTask(object):
             if sig in self.extender._raised_issues:
                 return
             self.extender._raised_issues.add(sig)
+        if not self._can_raise_issue():
+            return
         sev = "High" if flag_code == 400 else "Medium"
         issue = TurboReplayIssue(
             http_service=entry.http_service, url=url,
@@ -831,6 +855,8 @@ class ReplayTask(object):
             if sig in self.extender._raised_issues:
                 return
             self.extender._raised_issues.add(sig)
+        if not self._can_raise_issue():
+            return
         sev = "High" if 400 in mismatch_samples else "Medium"
         issue = TurboReplayIssue(
             http_service=entry.http_service, url=url,
@@ -880,6 +906,8 @@ class ReplayTask(object):
             if sig in self.extender._raised_issues:
                 return
             self.extender._raised_issues.add(sig)
+        if not self._can_raise_issue():
+            return
         sev = "High" if 400 in mismatch_samples else "Medium"
         issue = TurboReplayIssue(
             http_service=entry.http_service, url=url,
@@ -931,6 +959,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._pool_size = 0
         self._pool_lock = threading.Lock()
         self._log_line_count = 0
+        self._issue_count = 0
+        self._max_issues = 5000
         # Issue deduplication: (host, mutation, severity) -> already raised
         self._raised_issues = set()
         self._raised_issues_lock = threading.Lock()
@@ -1044,7 +1074,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 return
             # Bound the dedup dict to prevent unbounded growth across long sessions
             if len(self._seen_paths) > 200000:
-                self._seen_paths.clear()
+                # Evict oldest half instead of clearing all. This prevents
+                # the rediscovery loop where cleared endpoints get re-queued
+                # and re-processed, wasting work and creating duplicates.
+                keys = list(self._seen_paths.keys())
+                for k in keys[:100000]:
+                    del self._seen_paths[k]
             self._seen_paths[key] = True
         try:
             default_count = int(self._replay_field.getText().strip())
@@ -1385,12 +1420,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     candidates = [(i, e) for i, e in enumerate(self.table_model.entries)
                                   if e.status == STATUS_ERROR
                                   and e.error_msg
-                                  and "Queue full" in e.error_msg]
+                                  and "Queue full" in e.error_msg
+                                  and e.retry_count < 3]
                 if not candidates:
                     continue
                 self._ensure_master_running()
                 refilled = 0
                 for i, e in candidates[:free]:
+                    e.retry_count += 1
                     e.status = STATUS_PENDING
                     e.error_msg = ""
                     if not self._work_queue.offer((e, i)):
@@ -1425,8 +1462,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         def is_finished(e):
             if e.status == STATUS_COMPLETED:
                 return True
-            if e.status == STATUS_ERROR and e.error_msg and "Queue full" in e.error_msg:
-                return False  # awaiting auto-refill, don't trim
+            if (e.status == STATUS_ERROR and e.error_msg
+                    and "Queue full" in e.error_msg and e.retry_count < 3):
+                return False  # awaiting auto-refill, don't trim yet
             return e.status == STATUS_ERROR
 
         with model._lock:
